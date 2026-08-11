@@ -134,6 +134,16 @@ class DACAOrchestrator:
             c1=self.thresholds.get("C1", 50.0),
             gamma_min=self.thresholds.get("gamma_min", 0.3),
         )
+        self.device_decomposer = DistanceFeasibleDecomposer(
+            self.device_llm,
+            c_task=self.thresholds.get("C_task", 30.0),
+            r_reach=self.thresholds.get("R_reach", 100.0),
+        )
+        self.device_coalition_formation = CoalitionFormation(
+            self.device_llm,
+            c1=self.thresholds.get("C1", 50.0),
+            gamma_min=self.thresholds.get("gamma_min", 0.3),
+        )
 
         if self.config.use_optimizations:
             self.continuity_engine = PlanContinuityEngine(
@@ -171,8 +181,8 @@ class DACAOrchestrator:
             cloud_llm=self.cloud_llm,
             device_llms=self.device_llms,
             peer_manager=self.peer_manager,
-            decomposer=self.decomposer,
-            coalition_formation=self.coalition_formation,
+            decomposer=self.device_decomposer,
+            coalition_formation=self.device_coalition_formation,
             use_distance_decomp=self.config.use_distance_decomp,
             use_coalition_feasibility=self.config.use_coalition_feasibility,
             continuity_engine=self.continuity_engine,
@@ -183,7 +193,7 @@ class DACAOrchestrator:
         )
         self.reallocator = PostSwitchReallocator(
             device_llms=self.device_llms,
-            coalition_formation=self.coalition_formation,
+            coalition_formation=self.device_coalition_formation,
             peer_manager=self.peer_manager,
         )
         self.metrics = MetricsCollector()

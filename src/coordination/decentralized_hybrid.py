@@ -542,7 +542,7 @@ class DecentralizedHybridCoordinator:
                     obs["instruction"], fleet, subtasks
                 )
             else:
-                assignments_map = self.cloud_llm.decompose(
+                assignments_map = self.device_llm.decompose(
                     obs["instruction"], obs["agents"], obs["subtasks"]
                 )
             if reused_assignments:
@@ -553,7 +553,7 @@ class DecentralizedHybridCoordinator:
                 fleet, subtasks, dist_mat, cqi_matrix
             )
         else:
-            coalitions = self.cloud_llm.form_coalitions(
+            coalitions = self.device_llm.form_coalitions(
                 obs["subtasks"], obs["agents"]
             )
 

@@ -20,7 +20,7 @@ from src.llm.cloud_llm_client import CloudLLMClient
 
 @dataclass
 class CoalitionFormation:
-    cloud_llm: CloudLLMClient
+    cloud_llm: Any
     c1: float = 50.0
     gamma_min: float = 0.3
     max_retries: int = 3

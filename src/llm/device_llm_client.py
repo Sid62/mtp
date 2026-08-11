@@ -338,9 +338,79 @@ class DeviceLLMClient:
             t_tok = usage.get("total_tokens", p_tok + c_tok)
             return text, p_tok, c_tok, t_tok
 
+    def _agent_id(self, agent: dict) -> str:
+        return str(agent.get("id", agent.get("agent_id", "")))
+
+    def _mock_assignments_from_inputs(
+        self, agents: list[dict], subtasks: list[dict]
+    ) -> dict[str, list[str]]:
+        assignments: dict[str, list[str]] = {}
+        if not agents:
+            return assignments
+        for i, st in enumerate(subtasks):
+            st_id = str(st.get("id", st.get("subtask_id", f"T_{i}")))
+            assignments[st_id] = [self._agent_id(agents[i % len(agents)])]
+        return assignments
+
+    def _mock_coalitions_from_inputs(self, agents: list[dict]) -> list[dict]:
+        coalitions: list[dict] = []
+        for i in range(0, len(agents), 2):
+            group = [self._agent_id(a) for a in agents[i : i + 2] if self._agent_id(a)]
+            if group:
+                coalitions.append({"coalition_id": len(coalitions), "members": group})
+        return coalitions
+
+    def _extract_labeled_json(self, prompt: str, label: str) -> Any | None:
+        low_prompt = prompt.lower()
+        low_label = label.lower() + ":"
+        idx = low_prompt.find(low_label)
+        if idx < 0:
+            return None
+        rest = prompt[idx + len(low_label) :].lstrip()
+        if not rest:
+            return None
+        opener = rest[0]
+        if opener not in "[{":
+            return None
+        closer = "]" if opener == "[" else "}"
+        depth = 0
+        in_string = False
+        escape = False
+        for pos, ch in enumerate(rest):
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(rest[: pos + 1])
+                    except json.JSONDecodeError:
+                        return None
+        return None
+
     def _mock_response(self, prompt: str) -> str:
         pl = prompt.lower()
         managed = self.managed_agent_ids or [self.node_id]
+        if "decompose" in pl or "task decomposer" in pl:
+            agents = self._extract_labeled_json(prompt, "Agents")
+            subtasks = self._extract_labeled_json(prompt, "Subtasks")
+            if isinstance(agents, list) and isinstance(subtasks, list):
+                return json.dumps({"assignments": self._mock_assignments_from_inputs(agents, subtasks)})
+        if "coalition" in pl:
+            agents = self._extract_labeled_json(prompt, "Agents")
+            if isinstance(agents, list):
+                return json.dumps({"coalitions": self._mock_coalitions_from_inputs(agents)})
         if "dispatch" in pl:
             return json.dumps({"dispatched": True, "assignments": {}})
         if "plan_local" in pl or "plan locally" in pl:
@@ -367,6 +437,59 @@ class DeviceLLMClient:
         if "coordinate" in pl or "realloc" in pl:
             return json.dumps({"action": "reallocate", "status": "ok"})
         return json.dumps({"status": "ack"})
+
+    def decompose(
+        self,
+        instruction: str,
+        agents: list[dict],
+        subtasks: list[dict],
+        distance_matrix: list[list[float]] | None = None,
+    ) -> dict[str, list[str]]:
+        """Device-level task decomposition for decentralized mode."""
+        prompt = (
+            f"Decompose subtask assignments locally for domain {self.node_id}.\n"
+            f"Instruction: {instruction}\n"
+            f"Agents: {json.dumps(agents)}\n"
+            f"Subtasks: {json.dumps(subtasks)}\n"
+            f"Distance matrix: {json.dumps(distance_matrix or [])}\n"
+            'Return JSON ONLY: {"assignments": {"T_0": ["uav_1"], ...}}'
+        )
+        raw = self.complete(prompt, caller="device_decompose")
+        parsed = self._parse_json_response(raw)
+        if isinstance(parsed, dict) and "assignments" in parsed and isinstance(parsed["assignments"], dict):
+            return parsed["assignments"]
+        if isinstance(parsed, dict) and parsed:
+            result = {}
+            for k, v in parsed.items():
+                if isinstance(k, str):
+                    result[k] = v if isinstance(v, list) else [str(v)]
+            if result:
+                return result
+        return self._mock_assignments_from_inputs(agents, subtasks)
+
+    def form_coalitions(
+        self,
+        subtasks: list[dict],
+        agents: list[dict],
+        distance_matrix: list[list[float]] | None = None,
+        cqi_matrix: list[list[float]] | None = None,
+    ) -> list[dict]:
+        """Device-level coalition formation for decentralized mode."""
+        prompt = (
+            f"Form agent coalitions locally for domain {self.node_id}.\n"
+            f"Subtasks: {json.dumps(subtasks)}\n"
+            f"Agents: {json.dumps(agents)}\n"
+            f"Distance matrix: {json.dumps(distance_matrix or [])}\n"
+            f"CQI matrix: {json.dumps(cqi_matrix or [])}\n"
+            'Return JSON ONLY: {"coalitions": [{"coalition_id": 0, "members": ["uav_1"]}, ...]}'
+        )
+        raw = self.complete(prompt, caller="device_form_coalitions")
+        parsed = self._parse_json_response(raw)
+        if isinstance(parsed, dict) and "coalitions" in parsed and isinstance(parsed["coalitions"], list):
+            return parsed["coalitions"]
+        if isinstance(parsed, list):
+            return parsed
+        return self._mock_coalitions_from_inputs(agents)
 
     def _parse_json_response(self, raw: str) -> dict[str, Any]:
         try:

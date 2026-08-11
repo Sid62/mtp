@@ -96,9 +96,13 @@ def compute_tfr(
 
 @dataclass
 class DistanceFeasibleDecomposer:
-    cloud_llm: CloudLLMClient
+    cloud_llm: Any
     c_task: float = 30.0
     r_reach: float = 100.0
+
+    @property
+    def llm_client(self) -> Any:
+        return self.cloud_llm
 
     def decompose(
         self,
