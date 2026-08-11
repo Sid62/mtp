@@ -262,6 +262,11 @@ class DACAOrchestrator:
         cqi_evaluation_time_s: float = 0.0
         coalition_computation_time_s: float = 0.0
         architecture_switching_time_s: float = 0.0
+        snapshot_capture_time_s: float = 0.0
+        state_restore_time_s: float = 0.0
+        state_verification_time_s: float = 0.0
+        coalition_transfer_time_s: float = 0.0
+        reallocation_time_s: float = 0.0
         state_handoff_time_s: float = 0.0
         coalition_repair_time_s: float = 0.0
         consensus_time_s: float = 0.0
@@ -339,20 +344,59 @@ class DACAOrchestrator:
                 print(f"{prev_mode_name} -> {mode_name}\n")
 
             if mode != prev_mode and self.config.use_handoff:
-                t_handoff_start = time.perf_counter()
-                snap = capture_snapshot(
+                t_snap1_start = time.perf_counter()
+                snap_before = capture_snapshot(
                     fleet, self.env.subtask_list, coalitions,
                     step, prev_mode, mode,
                     shared_plans=self.decentralized.shared_plans,
                     device_llms=self.device_llms,
                     pending_messages=self.peer_manager.pending_messages_all(),
                 )
-                restore_snapshot(fleet, snap)
+                t_snap1_end = time.perf_counter()
+                snapshot_capture_time_s += (t_snap1_end - t_snap1_start)
+
+                t_restore_start = time.perf_counter()
+                restore_snapshot(fleet, snap_before)
                 restore_distributed_state(
-                    snap, self.device_llms, self.peer_manager, self.decentralized
+                    snap_before, self.device_llms, self.peer_manager, self.decentralized
                 )
+                t_restore_end = time.perf_counter()
+                state_restore_time_s += (t_restore_end - t_restore_start)
+
+                t_snap2_start = time.perf_counter()
+                snap_after = capture_snapshot(
+                    fleet, self.env.subtask_list, coalitions,
+                    step, prev_mode, mode,
+                    shared_plans=self.decentralized.shared_plans,
+                    device_llms=self.device_llms,
+                    pending_messages=self.peer_manager.pending_messages_all(),
+                )
+                t_snap2_end = time.perf_counter()
+                snapshot_capture_time_s += (t_snap2_end - t_snap2_start)
+
+                t_verify_start = time.perf_counter()
+                is_preserved = verify_task_preservation(snap_before, snap_after)
+                t_verify_end = time.perf_counter()
+                state_verification_time_s += (t_verify_end - t_verify_start)
+
+                if not is_preserved:
+                    print("[WARNING] State handoff verification failed: runtime state not preserved across architecture switch.")
+
+                t_transfer_start = time.perf_counter()
                 self.ca_transfer.on_mode_change(mode)
+                t_transfer_end = time.perf_counter()
+                coalition_transfer_time_s += (t_transfer_end - t_transfer_start)
+
                 self.comm_counter.increment("handoff_reallocation", 1, "mode_handoff_snapshot_transfer")
+
+                state_handoff_time_s += (
+                    (t_snap1_end - t_snap1_start)
+                    + (t_restore_end - t_restore_start)
+                    + (t_snap2_end - t_snap2_start)
+                    + (t_verify_end - t_verify_start)
+                    + (t_transfer_end - t_transfer_start)
+                )
+
                 if self.config.use_reallocation and self.reallocator.should_trigger(
                     True, coalitions, fleet, dist_mat, cqi_matrix
                 ):
@@ -360,10 +404,11 @@ class DACAOrchestrator:
                     coalitions = self.reallocator.reallocate(
                         fleet, self.env.subtask_list, coalitions, dist_mat, cqi_matrix
                     )
-                    coalition_computation_time_s += (time.perf_counter() - t_realloc_start)
+                    t_realloc_end = time.perf_counter()
+                    realloc_dur = t_realloc_end - t_realloc_start
+                    coalition_computation_time_s += realloc_dur
+                    reallocation_time_s += realloc_dur
                     self.comm_counter.increment("handoff_reallocation", 1, "post_switch_coalition_reallocation")
-                verify_task_preservation(snap, snap)
-                state_handoff_time_s += (time.perf_counter() - t_handoff_start)
                 prev_mode = mode
 
             replan_now, replan_reason = should_replan(
@@ -616,6 +661,11 @@ class DACAOrchestrator:
             cqi_evaluation_time_s=cqi_evaluation_time_s,
             coalition_computation_time_s=coalition_computation_time_s,
             architecture_switching_time_s=architecture_switching_time_s,
+            snapshot_capture_time_s=snapshot_capture_time_s,
+            state_restore_time_s=state_restore_time_s,
+            state_verification_time_s=state_verification_time_s,
+            coalition_transfer_time_s=coalition_transfer_time_s,
+            reallocation_time_s=reallocation_time_s,
             state_handoff_time_s=state_handoff_time_s,
             coalition_repair_time_s=0.0,
             consensus_time_s=float(peer_metrics["consensus_latency"]),

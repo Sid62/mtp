@@ -262,14 +262,73 @@ def verify_task_preservation(
     before: GlobalSnapshot,
     after: GlobalSnapshot,
 ) -> bool:
-    """Eq 29: task preservation constraint."""
+    """Eq 29: task preservation constraint.
+    
+    Rigorously verifies state preservation across architecture handoff:
+    - All subtasks and completed subtasks sets match
+    - Pending subtask sets match
+    - Agent count and agent IDs match
+    - Per-agent assigned subtasks, completed subtasks, coalition IDs match
+    - Per-agent positions and remaining waypoints match
+    - Coalition structures match
+    - Shared plans, node states, and pending messages match (if present)
+    """
+    # 1. Subtask verification
     before_all = set(before.subtask_ids)
     after_all = set(after.subtask_ids)
     if before_all != after_all:
         return False
+
     before_completed = set(before.completed_subtasks)
     after_completed = set(after.completed_subtasks)
-    return before_completed == after_completed
+    if before_completed != after_completed:
+        return False
+
+    before_pending = before_all - before_completed
+    after_pending = after_all - after_completed
+    if before_pending != after_pending:
+        return False
+
+    # 2. Agent state verification
+    if len(before.agents) != len(after.agents):
+        return False
+
+    before_agents = {a.agent_id: a for a in before.agents}
+    after_agents = {a.agent_id: a for a in after.agents}
+    if set(before_agents.keys()) != set(after_agents.keys()):
+        return False
+
+    for agent_id, b_agent in before_agents.items():
+        a_agent = after_agents[agent_id]
+        if b_agent.assigned_subtasks != a_agent.assigned_subtasks:
+            return False
+        if b_agent.completed_subtasks != a_agent.completed_subtasks:
+            return False
+        if b_agent.coalition_id != a_agent.coalition_id:
+            return False
+        if len(b_agent.position) != len(a_agent.position):
+            return False
+        if not all(abs(p1 - p2) < 1e-4 for p1, p2 in zip(b_agent.position, a_agent.position)):
+            return False
+        if len(b_agent.remaining_waypoints) != len(a_agent.remaining_waypoints):
+            return False
+        for wp_b, wp_a in zip(b_agent.remaining_waypoints, a_agent.remaining_waypoints):
+            if len(wp_b) != len(wp_a) or not all(abs(w1 - w2) < 1e-4 for w1, w2 in zip(wp_b, wp_a)):
+                return False
+
+    # 3. Coalition structure verification
+    if before.coalitions != after.coalitions:
+        return False
+
+    # 4. Distributed state verification
+    if before.shared_plans != after.shared_plans:
+        return False
+    if before.node_states != after.node_states:
+        return False
+    if before.pending_messages != after.pending_messages:
+        return False
+
+    return True
 
 
 def slice_for_domain(

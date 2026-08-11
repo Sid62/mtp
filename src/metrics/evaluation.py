@@ -82,6 +82,11 @@ class ExperimentMetrics:
     cqi_evaluation_time_s: float = 0.0
     coalition_computation_time_s: float = 0.0
     architecture_switching_time_s: float = 0.0
+    snapshot_capture_time_s: float = 0.0
+    state_restore_time_s: float = 0.0
+    state_verification_time_s: float = 0.0
+    coalition_transfer_time_s: float = 0.0
+    reallocation_time_s: float = 0.0
     state_handoff_time_s: float = 0.0
     coalition_repair_time_s: float = 0.0
     consensus_time_s: float = 0.0
@@ -192,6 +197,11 @@ class ExperimentMetrics:
             "cqi_evaluation_time_s": round(self.cqi_evaluation_time_s, 4),
             "coalition_computation_time_s": round(self.coalition_computation_time_s, 4),
             "architecture_switching_time_s": round(self.architecture_switching_time_s, 4),
+            "snapshot_capture_time_s": round(self.snapshot_capture_time_s, 4),
+            "state_restore_time_s": round(self.state_restore_time_s, 4),
+            "state_verification_time_s": round(self.state_verification_time_s, 4),
+            "coalition_transfer_time_s": round(self.coalition_transfer_time_s, 4),
+            "reallocation_time_s": round(self.reallocation_time_s, 4),
             "state_handoff_time_s": round(self.state_handoff_time_s, 4),
             "coalition_repair_time_s": round(self.coalition_repair_time_s, 4),
             "consensus_time_s": round(self.consensus_time_s, 4),
@@ -328,6 +338,11 @@ class MetricsCollector:
         cqi_evaluation_time_s: float = 0.0,
         coalition_computation_time_s: float = 0.0,
         architecture_switching_time_s: float = 0.0,
+        snapshot_capture_time_s: float = 0.0,
+        state_restore_time_s: float = 0.0,
+        state_verification_time_s: float = 0.0,
+        coalition_transfer_time_s: float = 0.0,
+        reallocation_time_s: float = 0.0,
         state_handoff_time_s: float = 0.0,
         coalition_repair_time_s: float = 0.0,
         consensus_time_s: float = 0.0,
@@ -446,6 +461,11 @@ class MetricsCollector:
             cqi_evaluation_time_s=cqi_evaluation_time_s,
             coalition_computation_time_s=coalition_computation_time_s,
             architecture_switching_time_s=architecture_switching_time_s,
+            snapshot_capture_time_s=snapshot_capture_time_s,
+            state_restore_time_s=state_restore_time_s,
+            state_verification_time_s=state_verification_time_s,
+            coalition_transfer_time_s=coalition_transfer_time_s,
+            reallocation_time_s=reallocation_time_s,
             state_handoff_time_s=state_handoff_time_s,
             coalition_repair_time_s=coalition_repair_time_s,
             consensus_time_s=consensus_time_s,

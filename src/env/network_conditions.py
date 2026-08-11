@@ -77,6 +77,16 @@ class NetworkConditionGenerator:
     interference_dip_factor: float = 0.6   # temporary multiplicative dip, self-clearing
     fading_correlation: float = 0.85       # AR(1) coherence across steps
     _fading_state: float = field(default=0.0, init=False, repr=False)
+    _cached_step: int | None = field(default=None, init=False, repr=False)
+    _cached_q: float | None = field(default=None, init=False, repr=False)
+
+    def reset(self, seed: int | None = None) -> None:
+        """Reset network condition generator state and clear channel quality cache."""
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+        self._fading_state = 0.0
+        self._cached_step = None
+        self._cached_q = None
 
     def _distance_degradation(self) -> float | None:
        """1 - link quality in [0, 1] from average inter-agent distance.
@@ -99,7 +109,12 @@ class NetworkConditionGenerator:
         """Single bounded latent channel-quality variable Q(t) in [0,1],
         1.0 = perfect link. Downstream packet loss, latency, and bandwidth
         are physical co-variates of Q(t).
+        Packet loss, latency, and bandwidth for a given channel state
+        must derive from the same latent Q realization.
         """
+        if self._cached_step == t and self._cached_q is not None:
+            return self._cached_q
+
         from src.env.network_model import rician_fading_step, scenario_shadowing
 
         # 1) Profile-driven macro congestion & recovery dynamics
@@ -147,7 +162,11 @@ class NetworkConditionGenerator:
         )
 
         q = q_base * q_dist * q_shad * q_interf + fading
-        return float(np.clip(q, 0.05, 0.98))
+        q_val = float(np.clip(q, 0.05, 0.98))
+
+        self._cached_step = t
+        self._cached_q = q_val
+        return q_val
 
     def loss_rate_at(self, t: int) -> float:
         q = self._channel_quality(t)
@@ -158,11 +177,9 @@ class NetworkConditionGenerator:
         q = self._channel_quality(t)
         base = 0.01 + self.base_delay_prob * 0.5
         # Latency driven by the SAME channel quality that drives loss --
-        # physically both are downstream of the same SNR/throughput
-        # bottleneck, not independently-degrading quantities. Small
-        # independent measurement noise keeps latency from being a pure
-        # deterministic function of loss.
-        latency = base + (1.0 - q) * 1.5 + self.rng.uniform(0, 0.02)
+        # physically both are downstream of the same SNR/throughput bottleneck.
+        # Deterministic function of Q(t) for single-Q physical consistency.
+        latency = base + (1.0 - q) * 1.5
         return float(max(latency, 0.0))
 
     def bandwidth_at(self, t: int) -> float:

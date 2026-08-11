@@ -61,6 +61,8 @@ class DACAEnv:
             c2=self.thresholds.get("C2", 5.0),
             seed=self.seed,
         )
+        if hasattr(self.network, "reset"):
+            self.network.reset(self.seed)
         self.network.fleet = self.fleet  # re-connect after fleet rebuild
         self._subtasks = {s.subtask_id: s for s in self.scenario.subtasks}
         return self.get_observation()
