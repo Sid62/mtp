@@ -250,6 +250,7 @@ class DACAOrchestrator:
             self.experience_store.reset_run_metrics()
         self._plan_state = PlanState()
         self.decentralized.plan_reuse_count = 0
+        self.centralized.dispatch_skipped_count = 0
         self.coalition_formation.merged_singleton_count = 0
         self._replanning_count = 0
         self._coalition_change_count = 0
@@ -438,10 +439,11 @@ class DACAOrchestrator:
 
                 t_plan = time.perf_counter()
                 if mode == 0:
-                    assignments, coalitions, cloud_reasoned = self.centralized.plan(self.env, cqi_matrix)
+                    assignments, coalitions, cloud_reasoned, dispatch_occurred = self.centralized.plan(self.env, cqi_matrix)
                     if cloud_reasoned:
                         self.comm_counter.increment("global_planning", 1, "centralized_global_planning")
-                    self.comm_counter.increment("dispatch", 1, "centralized_domain_dispatch")  # unconditional
+                    if dispatch_occurred:
+                        self.comm_counter.increment("dispatch", 1, "centralized_domain_dispatch")
                     print(">>>> USING CENTRALIZED")
                 else:
                     print("\nEntering decentralized planner\n")
@@ -622,6 +624,7 @@ class DACAOrchestrator:
             hallucination_stats=self.cloud_llm.hallucination_stats,
             experience_reuse_attempts=self.experience_store.reuse_attempts if hasattr(self, "experience_store") and self.experience_store else 0,
             experience_reuse_hits=self.experience_store.reuse_hits if hasattr(self, "experience_store") and self.experience_store else 0,
+            dispatch_skipped_rounds=self.centralized.dispatch_skipped_count,
             # Upgraded fine-grained metrics
             cloud_prompt_tokens=self.cloud_llm.usage.prompt_tokens,
             cloud_completion_tokens=self.cloud_llm.usage.completion_tokens,

@@ -36,6 +36,10 @@ class CentralizedHybridCoordinator:
     continuity_engine: Any | None = None
     plan_repairer: Any | None = None
     experience_store: Any | None = None
+    # Delta dispatch: track last dispatched assignment state to suppress
+    # redundant Device LLM dispatch calls when assignments haven't changed.
+    _last_dispatched_assignments: dict[str, list[str]] = field(default_factory=dict)
+    dispatch_skipped_count: int = 0
 
     def __post_init__(self) -> None:
         if self.device_llms:
@@ -117,7 +121,15 @@ class CentralizedHybridCoordinator:
         self,
         env: DACAEnv,
         cqi_matrix: np.ndarray | None = None,
-    ) -> tuple[dict[str, list[str]], list[dict], bool]:
+    ) -> tuple[dict[str, list[str]], list[dict], bool, bool]:
+        """Plan and dispatch.
+
+        Returns:
+            (assignments, coalitions, cloud_reasoned, dispatch_occurred)
+            dispatch_occurred is False only when plan continuity reuses
+            assignments identical to the last dispatch — suppressing
+            the actual Device LLM dispatch calls, not just the counter.
+        """
         fleet = env.fleet
         subtasks = env.subtask_list
 
@@ -127,8 +139,16 @@ class CentralizedHybridCoordinator:
                 print("[PLAN-CONTINUITY] Centralized reusing valid active plan with updated assignments (0 LLM calls)")
                 assignments = self.continuity_engine.get_updated_executable_assignments(fleet, subtasks)
                 coalitions = self.continuity_engine.active_context.coalitions
-                self._dispatch_domains(coalitions)
-                return assignments, coalitions, False
+                # Delta dispatch: only re-dispatch if assignments actually changed
+                if assignments != self._last_dispatched_assignments:
+                    self._dispatch_domains(coalitions)
+                    self._last_dispatched_assignments = dict(assignments)
+                    print("[DELTA-DISPATCH] Continuity plan has changed assignments — dispatching")
+                    return assignments, coalitions, False, True
+                else:
+                    self.dispatch_skipped_count += 1
+                    print("[DELTA-DISPATCH] Assignments unchanged — skipping redundant dispatch")
+                    return assignments, coalitions, False, False
 
 
         obs = env.get_observation()
@@ -170,8 +190,10 @@ class CentralizedHybridCoordinator:
         if self.continuity_engine is not None:
             self.continuity_engine.set_active_plan(assignments_map, coalitions, subtasks, mode=0)
 
+        # New plan always requires dispatch
         self._dispatch_domains(coalitions)
-        return assignments_map, coalitions, cloud_reasoned
+        self._last_dispatched_assignments = dict(assignments_map)
+        return assignments_map, coalitions, cloud_reasoned, True
 
     def execute_step(
         self,

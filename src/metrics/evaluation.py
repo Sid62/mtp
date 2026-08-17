@@ -119,6 +119,7 @@ class ExperimentMetrics:
     merged_singleton_count: int = 0
     communication_steps: int = 0
     paper_communication_steps: int = 0
+    dispatch_skipped_rounds: int = 0
     communication_step_breakdown: dict[str, int] = field(default_factory=dict)
     hallucination_stats: dict[str, Any] = field(default_factory=dict)
     experience_reuse_attempts: int = 0
@@ -241,6 +242,7 @@ class ExperimentMetrics:
             "coalition_change_count": self.coalition_change_count,
             "communication_steps": self.communication_steps,
             "paper_communication_steps": self.paper_communication_steps,
+            "dispatch_skipped_rounds": self.dispatch_skipped_rounds,
             "communication_step_breakdown": dict(self.communication_step_breakdown),
             "hallucination_stats": dict(self.hallucination_stats),
             "experience_reuse_attempts": self.experience_reuse_attempts,
@@ -301,6 +303,7 @@ class MetricsCollector:
         hallucination_stats: dict[str, Any] | None = None,
         experience_reuse_attempts: int = 0,
         experience_reuse_hits: int = 0,
+        dispatch_skipped_rounds: int = 0,
         # Upgraded keyword arguments with safe defaults
         cloud_prompt_tokens: int = 0,
         cloud_completion_tokens: int = 0,
@@ -423,6 +426,7 @@ class MetricsCollector:
             hallucination_stats=dict(hallucination_stats or {}),
             experience_reuse_attempts=experience_reuse_attempts,
             experience_reuse_hits=experience_reuse_hits,
+            dispatch_skipped_rounds=dispatch_skipped_rounds,
             cloud_prompt_tokens=cloud_prompt_tokens,
             cloud_completion_tokens=cloud_completion_tokens,
             cloud_total_tokens=c_tot,

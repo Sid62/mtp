@@ -101,3 +101,32 @@ def test_orchestrator_communication_steps_recording():
     assert d["paper_communication_steps"] == expected_paper_steps
 
 
+def test_delta_dispatch_diagnostics():
+    """Verify that delta dispatch optimization produces diagnostic fields in results."""
+    orch = DACAOrchestrator(
+        scenario="logistics",
+        network_profile="stable",
+        seed=0,
+        config=CONFIGS["A5"],
+        max_steps=20,
+    )
+    orch.cloud_llm.config["use_mock"] = True
+    for dc in orch.device_llms.values():
+        dc.config["use_mock"] = True
+
+    metrics = orch.run()
+    d = metrics.to_dict()
+
+    # dispatch_skipped_rounds must be present in results for audit transparency
+    assert "dispatch_skipped_rounds" in d
+    assert isinstance(d["dispatch_skipped_rounds"], int)
+    assert d["dispatch_skipped_rounds"] >= 0
+
+    # paper_communication_steps must still equal global_planning + dispatch
+    breakdown = d["communication_step_breakdown"]
+    expected_paper_steps = breakdown.get("global_planning", 0) + breakdown.get("dispatch", 0)
+    assert d["paper_communication_steps"] == expected_paper_steps
+
+    # centralized coordinator must expose dispatch_skipped_count
+    assert hasattr(orch.centralized, "dispatch_skipped_count")
+    assert orch.centralized.dispatch_skipped_count == d["dispatch_skipped_rounds"]
