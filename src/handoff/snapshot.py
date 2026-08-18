@@ -53,40 +53,9 @@ def _client_for_node_state(
 def _apply_node_state(client: Any, ns_data: dict[str, Any]) -> None:
     """Restore or merge NodeState into a domain Device LLM client."""
     restored = NodeState.from_dict(ns_data)
-    if client.node_state is None:
-        client.node_state = restored
-        if getattr(client, "managed_agent_ids", None) is not None:
-            client.managed_agent_ids = list(restored.managed_agent_ids)
-        return
-
-    if restored.node_id == client.node_id:
-        client.node_state = restored
-        if getattr(client, "managed_agent_ids", None) is not None:
-            client.managed_agent_ids = list(restored.managed_agent_ids)
-        return
-
-    # Legacy per-robot snapshot -> merge into domain-level state
-    client.node_state.local_observations.update(restored.local_observations)
-    if restored.local_observation:
-        agent_id = str(restored.local_observation.get("agent_id", restored.node_id))
-        client.node_state.local_observations[agent_id] = restored.local_observation
-    merged_managed = set(client.node_state.managed_agent_ids)
-    merged_managed.update(restored.managed_agent_ids)
-    merged_managed.update(client.node_state.local_observations.keys())
-    client.node_state.managed_agent_ids = sorted(merged_managed)
+    client.node_state = restored
     if getattr(client, "managed_agent_ids", None) is not None:
-        client.managed_agent_ids = list(client.node_state.managed_agent_ids)
-    client.node_state.shared_plan_version = max(
-        client.node_state.shared_plan_version,
-        restored.shared_plan_version,
-    )
-    if restored.shared_plan:
-        client.node_state.shared_plan = restored.shared_plan
-    if restored.current_task is not None:
-        client.node_state.current_task = restored.current_task
-    client.node_state.neighbor_plans.update(restored.neighbor_plans)
-    client.node_state.received_messages.extend(restored.received_messages)
-    client.node_state.belief_state.update(restored.belief_state)
+        client.managed_agent_ids = list(restored.managed_agent_ids)
 
 
 @dataclass
@@ -225,10 +194,10 @@ def restore_distributed_state(
     decentralized: Any | None = None,
 ) -> None:
     """Restore SharedPlan, domain NodeState, and pending messages after handoff."""
-    if decentralized is not None and snapshot.shared_plans:
+    if decentralized is not None:
         decentralized.shared_plans = {
             int(sp["coalition_id"]): SharedPlan.from_dict(sp)
-            for sp in snapshot.shared_plans
+            for sp in (snapshot.shared_plans or [])
         }
 
     for ns_data in snapshot.node_states:
@@ -240,8 +209,7 @@ def restore_distributed_state(
     if peer_manager is not None:
         if snapshot.device_domains:
             peer_manager.register_domain_peers(snapshot.device_domains)
-        if snapshot.pending_messages:
-            peer_manager.restore_pending_messages(snapshot.pending_messages)
+        peer_manager.restore_pending_messages(snapshot.pending_messages or {})
 
 
 def restore_snapshot(fleet: AgentFleet, snapshot: GlobalSnapshot) -> None:

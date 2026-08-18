@@ -263,9 +263,10 @@ class PeerCommunicationManager:
         }
 
     def restore_pending_messages(self, pending: dict[str, list[dict[str, Any]]]) -> None:
-        for nid, msgs in pending.items():
-            self.inboxes.setdefault(nid, [])
-            self.inboxes[nid].extend(PeerMessage.from_dict(m) for m in msgs)
+        self.inboxes = {
+            nid: [PeerMessage.from_dict(m) for m in msgs]
+            for nid, msgs in pending.items()
+        }
 
     def record_consensus_round(self, latency_s: float) -> None:
         before = self.consensus_rounds

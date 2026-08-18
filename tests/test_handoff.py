@@ -232,3 +232,43 @@ def test_plan_state_known_mode_tracking_across_architecture_switch(fleet, subtas
     assert reason_2 == ""
     assert plan_state.known_mode == 1
 
+
+def test_distributed_state_restoration_no_duplication(fleet, subtasks, coalitions):
+    """TEST 8: Distributed state restoration — verify inboxes and node_states do not duplicate messages."""
+    from src.communication.peer_manager import PeerCommunicationManager
+    from src.handoff.snapshot import capture_snapshot, restore_distributed_state, verify_task_preservation
+    from src.llm.device_llm_client import DeviceLLMClient
+
+    pm = PeerCommunicationManager()
+    pm.register_domain_peers(["uav", "robot", "vehicle"])
+    pm.send_message("uav", "robot", "realloc_proposal", {"test": 1})
+
+    device_llms = {
+        "uav": DeviceLLMClient(node_id="uav"),
+        "robot": DeviceLLMClient(node_id="robot"),
+        "vehicle": DeviceLLMClient(node_id="vehicle"),
+    }
+
+    # Capture BEFORE snapshot with 1 in-flight message in robot's inbox
+    before = capture_snapshot(
+        fleet, subtasks, coalitions, 10, 0, 1,
+        device_llms=device_llms,
+        pending_messages=pm.pending_messages_all(),
+    )
+    assert len(before.pending_messages.get("robot", [])) == 1
+
+    # Restore distributed state
+    restore_distributed_state(before, device_llms, peer_manager=pm)
+
+    # Capture AFTER snapshot
+    after = capture_snapshot(
+        fleet, subtasks, coalitions, 10, 0, 1,
+        device_llms=device_llms,
+        pending_messages=pm.pending_messages_all(),
+    )
+
+    # Verification must pass: inboxes must not have duplicated
+    assert len(after.pending_messages.get("robot", [])) == 1
+    assert verify_task_preservation(before, after)
+
+
