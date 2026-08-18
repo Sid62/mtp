@@ -186,7 +186,7 @@ class PeerCommunicationManager:
             payload=payload,
             ttl=ttl,
         )
-        self.inboxes[receiver].append(msg)
+        self.inboxes.setdefault(receiver, []).append(msg)
         self.sent_msg_cache[f"{sender}->{receiver}:{message_type}"] = payload_hash
         before = self.peer_messages
         self.peer_messages += 1
@@ -263,10 +263,9 @@ class PeerCommunicationManager:
         }
 
     def restore_pending_messages(self, pending: dict[str, list[dict[str, Any]]]) -> None:
-        self.inboxes = {
-            nid: [PeerMessage.from_dict(m) for m in msgs]
-            for nid, msgs in pending.items()
-        }
+        self.inboxes = {nid: [] for nid in self.registered_nodes}
+        for nid, msgs in pending.items():
+            self.inboxes[nid] = [PeerMessage.from_dict(m) for m in msgs]
 
     def record_consensus_round(self, latency_s: float) -> None:
         before = self.consensus_rounds

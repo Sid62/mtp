@@ -272,3 +272,38 @@ def test_distributed_state_restoration_no_duplication(fleet, subtasks, coalition
     assert verify_task_preservation(before, after)
 
 
+def test_post_switch_peer_communication_after_empty_restore(fleet, subtasks, coalitions):
+    """TEST 9: Post-switch peer broadcast & message delivery after empty state handoff restore."""
+    from src.communication.peer_manager import PeerCommunicationManager
+    from src.handoff.snapshot import capture_snapshot, restore_distributed_state
+    from src.llm.device_llm_client import DeviceLLMClient
+
+    pm = PeerCommunicationManager()
+    domains = ["uav", "robot", "vehicle"]
+    pm.register_domain_peers(domains)
+
+    device_llms = {d: DeviceLLMClient(node_id=d) for d in domains}
+
+    # Empty snapshot before handoff (no pending messages)
+    before = capture_snapshot(
+        fleet, subtasks, coalitions, 39, 0, 1,
+        device_llms=device_llms,
+        pending_messages=pm.pending_messages_all(),
+    )
+    assert before.pending_messages == {}
+
+    # State restoration
+    restore_distributed_state(before, device_llms, peer_manager=pm)
+
+    # Post-switch broadcast across all registered domains
+    for sender in domains:
+        delivered = pm.broadcast(sender, "realloc_proposal", {"test": sender})
+        assert delivered == len(domains) - 1, f"Broadcast from {sender} should deliver to {len(domains)-1} peers"
+
+    # All receivers can receive their messages cleanly without KeyError
+    for d in domains:
+        msgs = pm.receive_messages(d)
+        assert len(msgs) == len(domains) - 1
+
+
+
