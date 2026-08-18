@@ -201,3 +201,34 @@ def test_continue_execution(fleet, subtasks, coalitions):
     assert subtasks[1].completed
     assert "T_0" in fleet.agents[0].completed_subtasks
     assert "T_1" in fleet.agents[1].completed_subtasks
+
+
+def test_plan_state_known_mode_tracking_across_architecture_switch(fleet, subtasks, coalitions):
+    """TEST 7: Mode tracking consistency — verify known_mode updates when continuity absorbs switch."""
+    from src.coordination.replan_trigger import PlanState, should_replan, update_plan_state
+    from src.coordination.plan_continuity import PlanContinuityEngine
+
+    assignments = {"T_0": ["uav_0"]}
+    plan_state = PlanState()
+    update_plan_state(plan_state, subtasks, fleet, coalitions, assignments, mode=0)
+
+    cont_engine = PlanContinuityEngine()
+    cont_engine.set_active_plan(assignments, coalitions, subtasks, mode=0)
+
+    assert plan_state.known_mode == 0
+
+    # Step 1: Switch to mode 1 (Decentralized) with valid plan -> continuity absorbs it
+    replan_now, reason = should_replan(
+        plan_state, subtasks, fleet, coalitions, mode=1, continuity_engine=cont_engine
+    )
+    assert not replan_now
+    assert plan_state.known_mode == 1, "known_mode must update to 1 when continuity absorbs switch"
+
+    # Step 2: Next step in mode 1 -> should NOT re-trigger architecture_switched
+    replan_now_2, reason_2 = should_replan(
+        plan_state, subtasks, fleet, coalitions, mode=1, continuity_engine=cont_engine
+    )
+    assert not replan_now_2
+    assert reason_2 == ""
+    assert plan_state.known_mode == 1
+

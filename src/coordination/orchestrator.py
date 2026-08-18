@@ -410,6 +410,7 @@ class DACAOrchestrator:
                     coalition_computation_time_s += realloc_dur
                     reallocation_time_s += realloc_dur
                     self.comm_counter.increment("handoff_reallocation", 1, "post_switch_coalition_reallocation")
+            if mode != prev_mode:
                 prev_mode = mode
 
             replan_now, replan_reason = should_replan(

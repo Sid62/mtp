@@ -88,6 +88,7 @@ def should_replan(
             if continuity_engine.can_continue_plan(
                 fleet, subtasks, cqi_matrix, sys_cqi, packet_loss, latency
             ):
+                plan_state.known_mode = mode  # Record absorbed switch to prevent re-triggering
                 return False, ""
         return True, f"architecture_switched:{plan_state.known_mode}->{mode}"
     
