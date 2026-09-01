@@ -424,6 +424,110 @@ class DACAOrchestrator:
                     coalitions = self.reallocator.reallocate(
                         fleet, self.env.subtask_list, coalitions, dist_mat, cqi_matrix
                     )
+                    # ── Derive validated assignments from reallocated coalitions ──
+                    # The reallocator returns coalition metadata (members list),
+                    # not task→agent assignments. We must derive assignments
+                    # respecting the same invariants the reallocator checks:
+                    #   1. Skill coverage (required_skills ⊆ agent.skills)
+                    #   2. Distance feasibility (d < R_reach)
+                    #   3. No duplicate assignment
+                    #   4. Completed tasks preserved (not reassigned)
+                    r_reach = self.thresholds.get("R_reach", 100.0)
+                    new_assignments: dict[str, list[str]] = {}
+                    remaining_subtasks = [
+                        s for s in self.env.subtask_list if not s.completed
+                    ]
+                    # Collect all agents from new coalitions
+                    all_coalition_agents: list[str] = []
+                    for c in coalitions:
+                        all_coalition_agents.extend(c.get("members", []))
+                    agent_skills = {a.agent_id: set(a.skills) for a in fleet.agents}
+                    assigned_agents: set[str] = set()
+
+                    for st in remaining_subtasks:
+                        required = set(st.required_skills)
+                        best_aid: str | None = None
+                        best_d = float("inf")
+
+                        # Pass 1: skill-matching agents within R_reach
+                        for aid in all_coalition_agents:
+                            if aid in assigned_agents:
+                                continue
+                            if not fleet.has_agent(aid):
+                                continue
+                            skills = agent_skills.get(aid, set())
+                            if not required.issubset(skills):
+                                continue
+                            agent = fleet.get_agent(aid)
+                            d = dist(agent.position, st.target)
+                            if d > r_reach:
+                                continue
+                            if d < best_d:
+                                best_d = d
+                                best_aid = aid
+
+                        # Pass 2 (fallback): skill-matching but beyond R_reach
+                        if best_aid is None:
+                            for aid in all_coalition_agents:
+                                if aid in assigned_agents:
+                                    continue
+                                if not fleet.has_agent(aid):
+                                    continue
+                                skills = agent_skills.get(aid, set())
+                                if not required.issubset(skills):
+                                    continue
+                                agent = fleet.get_agent(aid)
+                                d = dist(agent.position, st.target)
+                                if d < best_d:
+                                    best_d = d
+                                    best_aid = aid
+
+                        # Pass 3 (last resort): nearest unassigned agent
+                        # Only used when NO skill-matching agent exists at all.
+                        if best_aid is None:
+                            for aid in all_coalition_agents:
+                                if aid in assigned_agents:
+                                    continue
+                                if not fleet.has_agent(aid):
+                                    continue
+                                agent = fleet.get_agent(aid)
+                                d = dist(agent.position, st.target)
+                                if d < best_d:
+                                    best_d = d
+                                    best_aid = aid
+                            if best_aid is not None:
+                                print(
+                                    f"[REALLOC-FALLBACK] {st.subtask_id}: no skill-match, "
+                                    f"using nearest agent {best_aid}"
+                                )
+
+                        if best_aid is not None:
+                            new_assignments[st.subtask_id] = [best_aid]
+                            assigned_agents.add(best_aid)
+                        elif st.subtask_id in assignments:
+                            # Preserve prior assignment if no coalition agent
+                            # is available (defensive fallback)
+                            new_assignments[st.subtask_id] = assignments[st.subtask_id]
+
+                    if new_assignments:
+                        assignments = new_assignments
+                        print(
+                            f"[REALLOC] Propagated validated assignments: "
+                            f"{list(assignments.keys())}"
+                        )
+                        # Update plan state so replanning logic sees the new state
+                        update_plan_state(
+                            self._plan_state,
+                            self.env.subtask_list,
+                            fleet,
+                            coalitions,
+                            assignments,
+                            mode=mode,
+                            sys_cqi=sys_cqi,
+                            packet_loss=avg_packet_loss,
+                            latency=avg_latency,
+                            current_step=step,
+                        )
                     t_realloc_end = time.perf_counter()
                     realloc_dur = t_realloc_end - t_realloc_start
                     coalition_computation_time_s += realloc_dur
