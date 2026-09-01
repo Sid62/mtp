@@ -528,10 +528,14 @@ class DACAOrchestrator:
                 cfr_history.append(cfr)
 
             targets = {s.subtask_id: s.target for s in self.env.subtask_list}
-            agent_assignments = {}
-            for sid, agents in assignments.items():
-                if agents:
-                    agent_assignments[agents[0]] = sid
+            if mode == 0:
+                # AutoHMA centralized execution: consume Device LLM ExecutionDirectives
+                agent_assignments = self.centralized.extract_executable_assignments(assignments)
+            else:
+                agent_assignments = {}
+                for sid, agents in assignments.items():
+                    if agents:
+                        agent_assignments[agents[0]] = sid
 
             t_sim_body = time.perf_counter()
             self.ca_transfer.step(self.env.fleet, mode, agent_assignments, targets)

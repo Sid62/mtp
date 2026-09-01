@@ -61,17 +61,34 @@ class CentralizedHybridCoordinator:
     def _coalitions_for_domain(
         coalitions: list[dict],
         managed_agent_ids: set[str],
+        assignments_map: dict[str, list[str]] | None = None,
     ) -> list[dict]:
         """Slice global coalitions to members managed by one Device LLM domain."""
+        agent_to_subtask: dict[str, str] = {}
+        if assignments_map:
+            for sid, agents in assignments_map.items():
+                for aid in agents:
+                    agent_to_subtask[aid] = sid
+
         scoped: list[dict] = []
         for coalition in coalitions:
             members = coalition.get("members", [])
             domain_members = [m for m in members if m in managed_agent_ids]
             if domain_members:
-                scoped.append({**coalition, "members": domain_members})
+                subtasks = [agent_to_subtask[m] for m in domain_members if m in agent_to_subtask]
+                scoped.append({
+                    **coalition,
+                    "members": domain_members,
+                    "subtasks": subtasks,
+                    "target_subtask": subtasks[0] if subtasks else None,
+                })
         return scoped
 
-    def _dispatch_domains(self, coalitions: list[dict]) -> None:
+    def _dispatch_domains(
+        self,
+        coalitions: list[dict],
+        assignments_map: dict[str, list[str]] | None = None,
+    ) -> None:
         """Each domain Device LLM dispatches to its managed agents only.
 
         AutoHMA alignment: capture dispatch output as ExecutionDirective
@@ -81,13 +98,17 @@ class CentralizedHybridCoordinator:
         self._last_dispatch_directives.clear()
         for domain_id, client in self.device_llms.items():
             managed = set(client.managed_agent_ids)
-            domain_coalitions = self._coalitions_for_domain(coalitions, managed)
+            domain_coalitions = self._coalitions_for_domain(coalitions, managed, assignments_map)
             if domain_coalitions:
                 result = client.dispatch(domain_coalitions, mode=0)
+                agent_assigns: dict[str, str] = {}
+                if isinstance(result, dict) and "assignments" in result and isinstance(result["assignments"], dict):
+                    agent_assigns = {k: str(v) for k, v in result["assignments"].items() if k in managed}
                 self._last_dispatch_directives[domain_id] = ExecutionDirective(
                     domain_id=domain_id,
                     dispatch_result=result,
                     coalitions=domain_coalitions,
+                    agent_assignments=agent_assigns,
                 )
 
     def _try_experience_reuse(
@@ -169,7 +190,7 @@ class CentralizedHybridCoordinator:
                 coalitions = self.continuity_engine.active_context.coalitions
                 # Delta dispatch: only re-dispatch if assignments actually changed
                 if assignments != self._last_dispatched_assignments:
-                    self._dispatch_domains(coalitions)
+                    self._dispatch_domains(coalitions, assignments)
                     self._last_dispatched_assignments = dict(assignments)
                     print("[DELTA-DISPATCH] Continuity plan has changed assignments — dispatching")
                     return assignments, coalitions, False, True
@@ -228,22 +249,48 @@ class CentralizedHybridCoordinator:
             self.continuity_engine.set_active_plan(assignments_map, coalitions, subtasks, mode=0)
 
         # New plan always requires dispatch
-        self._dispatch_domains(coalitions)
+        self._dispatch_domains(coalitions, assignments_map)
         self._last_dispatched_assignments = dict(assignments_map)
         return assignments_map, coalitions, cloud_reasoned, True
+
+    def extract_executable_assignments(
+        self,
+        fallback_assignments: dict[str, list[str]],
+    ) -> dict[str, str]:
+        """Extract agent -> subtask mapping consumed directly from Device LLM ExecutionDirectives.
+        
+        AutoHMA flow:
+        Cloud Plan -> Device LLM Dispatch -> ExecutionDirective -> Agent Execution Path.
+        """
+        agent_assignments: dict[str, str] = {}
+        # 1. Base active subtasks from global assignments
+        for sid, agents in fallback_assignments.items():
+            if agents:
+                agent_assignments[agents[0]] = sid
+
+        # 2. Consume and apply Device LLM ExecutionDirectives
+        for directive in self._last_dispatch_directives.values():
+            for aid, sid in directive.agent_assignments.items():
+                if sid in fallback_assignments:
+                    agent_assignments[aid] = sid
+            if "assignments" in directive.dispatch_result and isinstance(directive.dispatch_result["assignments"], dict):
+                for aid, sid in directive.dispatch_result["assignments"].items():
+                    if str(sid) in fallback_assignments:
+                        agent_assignments[aid] = str(sid)
+
+        return agent_assignments
 
     def execute_step(
         self,
         env: DACAEnv,
-        assignments: dict[str, str],
+        assignments: dict[str, list[str]],
     ) -> None:
+        """Execute centralized step consuming Device LLM ExecutionDirectives."""
         targets = {
             s.subtask_id: s.target for s in env.subtask_list
         }
-        agent_assignments = {}
-        for sid, agents in assignments.items():
-            if agents:
-                agent_assignments[agents[0]] = sid
+        # Consume Device LLM ExecutionDirectives
+        agent_assignments = self.extract_executable_assignments(assignments)
         self.nmpc.step(env.fleet, agent_assignments, targets)
 
         for sid, agent_list in assignments.items():

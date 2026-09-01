@@ -66,13 +66,22 @@ class ExecutionDirective:
     AutoHMA flow: Cloud LLM → Device LLM → Generative Agent
     This represents the Device LLM → Generative Agent directive.
     The actual control remains with the existing PID/NMPC/Q-learning;
-    this is the structural link, not a replacement.
+    this is the structural link that is consumed by the execution path.
     """
 
     domain_id: str = ""
     dispatch_result: dict[str, Any] = field(default_factory=dict)
     coalitions: list[dict] = field(default_factory=list)
+    agent_assignments: dict[str, str] = field(default_factory=dict)
     step: int = 0
+
+    def get_agent_assignment(self, agent_id: str) -> str | None:
+        """Extract assigned subtask id for a specific agent from this domain directive."""
+        if agent_id in self.agent_assignments:
+            return self.agent_assignments[agent_id]
+        if "assignments" in self.dispatch_result and agent_id in self.dispatch_result["assignments"]:
+            return self.dispatch_result["assignments"][agent_id]
+        return None
 
 
 def format_feedback_for_cloud(
@@ -81,6 +90,7 @@ def format_feedback_for_cloud(
     """Format Device LLM feedbacks as a compact context string for Cloud LLM.
 
     Takes the latest feedback per domain to avoid redundant duplication across steps.
+    Includes explicit self-correction instructions for the Cloud planner.
     Returns None if there is no meaningful feedback to include,
     avoiding prompt bloat on the first planning call.
     """
@@ -99,7 +109,12 @@ def format_feedback_for_cloud(
     if not has_content:
         return None
 
-    lines = ["[Previous Execution Feedback]"]
+    lines = [
+        "[Previous Execution Feedback & Self-Correction Context]",
+        "Instructions: Review previous execution feedback before generating the next plan.",
+        "If previous assignments produced incomplete tasks, insufficient progress, or bottlenecks, refine the allocation accordingly.",
+        "Do not blindly repeat assignments that proved ineffective in the feedback.",
+    ]
     for domain_id in sorted(latest_by_domain.keys()):
         line = latest_by_domain[domain_id].to_context_string()
         if line:
