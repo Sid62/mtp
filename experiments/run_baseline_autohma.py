@@ -39,11 +39,21 @@ def main() -> None:
         max_steps=args.max_steps,
     )
     try:
-      metrics = orch.run()
+        metrics = orch.run()
+        result = metrics.to_dict()
     except ExperimentFailed as e:
-      print(f"[FAILED] {e}")
-      return
-    result = metrics.to_dict()
+        print(f"[FAILED] {e}")
+        report_data = e.report.to_dict() if hasattr(e.report, "to_dict") else {}
+        result = {
+            "config": config_key,
+            "scenario": args.scenario,
+            "profile": args.profile,
+            "seed": args.seed,
+            "success_rate": 0.0,
+            "run_status": getattr(e.report, "experiment_status", "FAILED"),
+            "failure_reason": getattr(e.report, "failure_reason", str(e)),
+            "report": report_data,
+        }
     print(json.dumps(result, indent=2))
 
     if args.output:

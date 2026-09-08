@@ -20,19 +20,9 @@ from src.communication.models import NodeState, PeerMessage, SharedPlan
 from src.config import get_llm_config, project_root
 
 
-# PAPER INTERPRETATION NOTE (memory_mb):
-# The AutoHMA-LLM base paper's "Memory Usage per Device LLM" is measured here as the
-# local orchestrator/controller process's own memory footprint (via
-# psutil.Process(os.getpid()).memory_info().rss), NOT the memory required to host or
-# run the underlying LLM's own weights/inference engine. This interpretation is based
-# on: (1) the paper's reported magnitude (40-70 MB) being 2-3 orders of magnitude too
-# small to represent hosting memory for either model the paper uses in this role
-# (GPT-4, API-only and not independently inspectable; Llama2-70B, which alone requires
-# ~140GB in fp16), and (2) the paper's explicit framing of the Device LLM as a
-# lightweight "dispatcher" role, distinct from the "heavy reasoning" attributed to the
-# Cloud LLM. This is a documented, evidence-based assumption, not a fact confirmed by
-# the paper, since the paper never explicitly states what the metric measures at an
-# implementation level.
+# PAPER METRIC DEFINITION (memory_mb):
+# Memory (MB) is measured as the maximum per-call resident-set-size (RSS) increase observed
+# during Device-LLM inference across all device agents.
 
 
 @dataclass
@@ -50,7 +40,7 @@ class DeviceLLMUsage:
     failed_calls: int = 0
     retried_calls: int = 0
     cache_hits: int = 0
-    memory_mb: float = 0.0
+    memory_mb: float = 0.0  # peak per-call Device-LLM RSS delta in MB
     python_heap_delta_mb: float = 0.0
     python_heap_delta_by_device: dict[str, float] = field(default_factory=dict)
     tokens_processed_by_device: dict[str, int] = field(default_factory=dict)
@@ -214,8 +204,8 @@ class DeviceLLMClient:
                 heap_delta_mb = 0.0
             self.usage.heap_delta_mb_samples.append(heap_delta_mb)
 
-            # Whole-process RSS at time of domain call (system-level, kept for backward compatibility)
-            self.usage.memory_mb = rss_after / (1024 * 1024)
+            # Peak per-call Device-LLM RSS delta in MB for this client
+            self.usage.memory_mb = max(self.usage.memory_mb, rss_delta)
             self.usage.python_heap_delta_mb = max(self.usage.python_heap_delta_mb, heap_delta_mb)
 
             if cache_path:
@@ -258,8 +248,8 @@ class DeviceLLMClient:
                 heap_delta_mb = 0.0
             self.usage.heap_delta_mb_samples.append(heap_delta_mb)
 
-            # Whole-process RSS at time of domain call (system-level, kept for backward compatibility)
-            self.usage.memory_mb = rss_after / (1024 * 1024)
+            # Peak per-call Device-LLM RSS delta in MB for this client
+            self.usage.memory_mb = max(self.usage.memory_mb, rss_delta)
             self.usage.python_heap_delta_mb = max(self.usage.python_heap_delta_mb, heap_delta_mb)
 
             print(f"[COUNTER] metric=device_planning_calls step={step} before={before} after={after} reason={caller} caller=DeviceLLMClient.complete()")
@@ -345,9 +335,31 @@ class DeviceLLMClient:
         assignments: dict[str, list[str]] = {}
         if not agents:
             return assignments
+        assigned_agents: set[str] = set()
         for i, st in enumerate(subtasks):
             st_id = str(st.get("id", st.get("subtask_id", f"T_{i}")))
-            assignments[st_id] = [self._agent_id(agents[i % len(agents)])]
+            req_skills = set(st.get("required_skills", []))
+            best_agent = None
+            best_overlap = -1
+            for a in agents:
+                aid = self._agent_id(a)
+                if aid in assigned_agents:
+                    continue
+                skills = set(a.get("skills", []))
+                overlap = len(req_skills & skills)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_agent = aid
+            if not best_agent:
+                for a in agents:
+                    aid = self._agent_id(a)
+                    if aid not in assigned_agents:
+                        best_agent = aid
+                        break
+            if not best_agent:
+                best_agent = self._agent_id(agents[i % len(agents)])
+            assignments[st_id] = [best_agent]
+            assigned_agents.add(best_agent)
         return assignments
 
     def _mock_coalitions_from_inputs(self, agents: list[dict]) -> list[dict]:
@@ -931,9 +943,6 @@ def aggregate_device_usage(device_llms: dict[str, DeviceLLMClient]) -> DeviceLLM
         total.cache_hits += client.usage.cache_hits
         total.llm_wait_s += client.usage.llm_wait_s
         total.device_inference_time_s += client.usage.device_inference_time_s
-    non_zero_readings = [c.usage.memory_mb for c in device_llms.values() if c.usage.memory_mb > 0]
-    total.memory_mb = max(non_zero_readings) if non_zero_readings else 0.0
-
     # Build real per-domain memory dictionaries
     device_llm_memory_mb = {
         domain: float(np.mean(client.usage.rss_delta_mb_samples)) if client.usage.rss_delta_mb_samples else 0.0
@@ -951,6 +960,10 @@ def aggregate_device_usage(device_llms: dict[str, DeviceLLMClient]) -> DeviceLLM
     total.device_llm_memory_mb = device_llm_memory_mb
     total.device_llm_memory_peak_mb = device_llm_memory_peak_mb
     total.device_llm_heap_delta_mb = device_llm_heap_delta_mb
+
+    # Global peak per-call Device-LLM RSS delta across all device agents/domains
+    all_rss_samples = [s for c in device_llms.values() for s in c.usage.rss_delta_mb_samples]
+    total.memory_mb = float(max(all_rss_samples)) if all_rss_samples else 0.0
 
     total.python_heap_delta_by_device = device_llm_heap_delta_mb
     total.python_heap_delta_mb = max(device_llm_heap_delta_mb.values(), default=0.0)

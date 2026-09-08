@@ -57,6 +57,20 @@ class LLMUsage:
     plan_continuity_reuse: int = 0
     device_local_reallocation: int = 0
 
+    # Parser metrics
+    parse_failures: int = 0
+    schema_failures: int = 0
+    successful_parses: int = 0
+    parser_time_s: float = 0.0
+
+    @property
+    def cloud_calls(self) -> int:
+        return self.cloud_api_calls
+
+    @property
+    def cloud_retries(self) -> int:
+        return self.retried_calls
+
     def reset(self) -> None:
         self.tokens = 0
         self.prompt_tokens = 0
@@ -89,6 +103,10 @@ class LLMUsage:
         self.semantic_cache_hits = 0
         self.plan_continuity_reuse = 0
         self.device_local_reallocation = 0
+        self.parse_failures = 0
+        self.schema_failures = 0
+        self.successful_parses = 0
+        self.parser_time_s = 0.0
 
     def call_attribution(self) -> dict[str, int]:
         """Cloud call counts broken down by triggering cause (reporting only)."""
@@ -504,9 +522,31 @@ class CloudLLMClient:
         assignments: dict[str, list[str]] = {}
         if not agents:
             return assignments
+        assigned_agents: set[str] = set()
         for i, st in enumerate(subtasks):
             st_id = str(st.get("id", st.get("subtask_id", f"T_{i}")))
-            assignments[st_id] = [self._agent_id(agents[i % len(agents)])]
+            req_skills = set(st.get("required_skills", []))
+            best_agent = None
+            best_overlap = -1
+            for a in agents:
+                aid = self._agent_id(a)
+                if aid in assigned_agents:
+                    continue
+                skills = set(a.get("skills", []))
+                overlap = len(req_skills & skills)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_agent = aid
+            if not best_agent:
+                for a in agents:
+                    aid = self._agent_id(a)
+                    if aid not in assigned_agents:
+                        best_agent = aid
+                        break
+            if not best_agent:
+                best_agent = self._agent_id(agents[i % len(agents)])
+            assignments[st_id] = [best_agent]
+            assigned_agents.add(best_agent)
         return assignments
 
     def _mock_coalitions_from_inputs(self, agents: list[dict]) -> list[dict]:
@@ -883,8 +923,8 @@ class CloudLLMClient:
                     result = result_retry
                     stripped_map = {}
 
-        # Strategy 2: Intelligent Role Substitution for remaining under-staffed coalitions
-        if stripped_map:
+        # Strategy 2: Intelligent Role Substitution for remaining under-staffed coalitions (DACA only)
+        if stripped_map and self.experiment_architecture not in ("B1", "B2"):
             assigned_members = {m for c in result for m in c.get("members", [])}
             unassigned_agents = [
                 a for a in agents
@@ -920,6 +960,11 @@ class CloudLLMClient:
                         self.hallucination_stats["partial_strips"] += 1
 
         if not result:
+            if self.experiment_architecture in ("B1", "B2"):
+                print("[COALITION_STATUS] coalition_status=failed")
+                _log(f"[COALITION_STATUS] coalition_status=failed: form_coalitions produced no valid coalitions for baseline {self.experiment_architecture}")
+                self.last_coalitions_parsed = []
+                return []
             _log("form_coalitions: no valid coalitions remain, using per-agent singletons")
             self.hallucination_stats["singleton_fallbacks"] += 1
             result = self._singleton_coalitions(agents)
@@ -932,6 +977,13 @@ class CloudLLMClient:
         """Extract and robustly parse JSON from text, auto-repairing truncated JSON endings."""
         if not text:
             return {}
+        try:
+            parsed = self._parse_relaxed_json(text)
+            if isinstance(parsed, dict) and parsed:
+                return parsed
+        except Exception:
+            pass
+
         try:
             start = text.index("{")
             end = text.rindex("}") + 1
@@ -1006,28 +1058,50 @@ class CloudLLMClient:
         self, raw: str, agents: list[dict],
     ) -> tuple[list[dict], bool, dict[int, list[str]]]:
         """Robustly extract coalitions from a real LLM response, returning (coalitions, fallback_used, stripped_map)."""
-        parsed = self._parse_json(raw)
+        t0 = time.perf_counter()
+        parsed = self._parse_relaxed_json(raw)
         valid_agent_ids = {
             str(a.get("id", a.get("agent_id")))
             for a in agents
             if a.get("id") or a.get("agent_id")
         }
-        for key in self._COALITION_KEYS:
-            val = parsed.get(key)
-            if isinstance(val, list) and val:
-                norm, stripped = self._normalize_coalitions(val, valid_agent_ids)
-                if norm or stripped:
-                    return norm, False, stripped
-        for val in parsed.values():
-            if isinstance(val, list) and val and isinstance(val[0], dict):
-                norm, stripped = self._normalize_coalitions(val, valid_agent_ids)
-                if norm or stripped:
-                    return norm, False, stripped
+        if isinstance(parsed, dict):
+            for key in self._COALITION_KEYS:
+                val = parsed.get(key)
+                if isinstance(val, list) and val:
+                    norm, stripped = self._normalize_coalitions(val, valid_agent_ids)
+                    if norm or stripped:
+                        self.usage.successful_parses += 1
+                        self.usage.parser_time_s += (time.perf_counter() - t0)
+                        return norm, False, stripped
+            for val in parsed.values():
+                if isinstance(val, list) and val and isinstance(val[0], dict):
+                    norm, stripped = self._normalize_coalitions(val, valid_agent_ids)
+                    if norm or stripped:
+                        self.usage.successful_parses += 1
+                        self.usage.parser_time_s += (time.perf_counter() - t0)
+                        return norm, False, stripped
+        elif isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+            norm, stripped = self._normalize_coalitions(parsed, valid_agent_ids)
+            if norm or stripped:
+                self.usage.successful_parses += 1
+                self.usage.parser_time_s += (time.perf_counter() - t0)
+                return norm, False, stripped
+
         bare = self._parse_json_list(raw)
         if bare and isinstance(bare[0], dict):
             norm, stripped = self._normalize_coalitions(bare, valid_agent_ids)
             if norm or stripped:
+                self.usage.successful_parses += 1
+                self.usage.parser_time_s += (time.perf_counter() - t0)
                 return norm, False, stripped
+
+        self.usage.parse_failures += 1
+        self.usage.parser_time_s += (time.perf_counter() - t0)
+        if self.experiment_architecture in ("B1", "B2"):
+            _log(f"form_coalitions: could not extract valid coalitions from LLM "
+                 f"response (len={len(raw)}) for baseline {self.experiment_architecture}")
+            return [], True, {}
         _log("form_coalitions: could not extract valid coalitions from LLM "
              f"response (len={len(raw)}), generating per-agent singletons")
         return self._singleton_coalitions(agents), True, {}
@@ -1321,6 +1395,7 @@ class CloudLLMClient:
 
             return {}
 
+        t0 = time.perf_counter()
         parsed = self._parse_relaxed_json(raw)
         raw_result = extract_from_obj(parsed)
 
@@ -1340,8 +1415,13 @@ class CloudLLMClient:
             if clean_agents:
                 clean_result[sid] = clean_agents
 
-        if not clean_result and raw and raw.strip():
-            _log(f"[PARSER ERROR] _parse_assignments_response: could not extract valid assignments from LLM response (len={len(raw)}): {raw[:300]}")
+        self.usage.parser_time_s += (time.perf_counter() - t0)
+        if clean_result:
+            self.usage.successful_parses += 1
+        else:
+            self.usage.parse_failures += 1
+            if raw and raw.strip():
+                _log(f"[PARSER ERROR] _parse_assignments_response: could not extract valid assignments from LLM response (len={len(raw)}): {raw[:300]}")
 
         return clean_result
 

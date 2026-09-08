@@ -93,12 +93,22 @@ class DACAEnv:
                 target = self._subtasks[subtask_id].target
                 self.fleet.step_toward(agent_id, target)
 
-    def mark_subtask_complete(self, subtask_id: str) -> None:
+    def mark_subtask_complete(self, subtask_id: str) -> bool:
+        """Mark a subtask complete idempotently.
+
+        Returns True iff this call transitioned the subtask from incomplete to complete.
+        If the subtask is already complete, does nothing and returns False.
+        """
         if subtask_id in self._subtasks:
-            self._subtasks[subtask_id].completed = True
+            subtask = self._subtasks[subtask_id]
+            if subtask.completed:
+                return False
+            subtask.completed = True
             print(f"[COMPLETE] {subtask_id}")
             if subtask_id not in self.state.completed_subtasks:
                 self.state.completed_subtasks.append(subtask_id)
+            return True
+        return False
 
     def check_mission_complete(self) -> bool:
         return all(s.completed for s in self._subtasks.values())

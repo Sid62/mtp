@@ -22,7 +22,7 @@ class ExperimentMetrics:
     cloud_api_calls: int
     device_api_calls: int
     total_api_calls: int
-    device_memory_mb: float
+    device_memory_mb: float  # peak per-call Device-LLM RSS delta in MB
     computation_s: float
     total_wall_clock_s: float = 0.0
     tfr: float = 1.0
@@ -96,6 +96,12 @@ class ExperimentMetrics:
     planning_time_s: float = 0.0
     network_waiting_time_s: float = 0.0
     simulation_computation_time_s: float = 0.0
+    cloud_wait_s: float = 0.0
+    device_wait_s: float = 0.0
+    parser_time_s: float = 0.0
+    simulation_time_s: float = 0.0
+    validation_time_s: float = 0.0
+    run_status: str = "SUCCESS"
 
     # Upgraded planning latency distribution
     avg_planning_latency: float = 0.0
@@ -181,7 +187,8 @@ class ExperimentMetrics:
             "semantic_cache_hits": self.semantic_cache_hits,
             "disk_cache_hits": self.cache_hits,
             "cloud_call_attribution": dict(self.cloud_call_attribution),
-            "memory_mb": round(self.device_memory_mb, 1),
+            # memory_mb: peak per-call Device-LLM RSS delta in MB
+            "memory_mb": round(self.device_memory_mb, 4),
             "device_llm_memory_mb": {k: round(v, 4) for k, v in self.device_llm_memory_mb.items()},
             "device_llm_memory_peak_mb": {k: round(v, 4) for k, v in self.device_llm_memory_peak_mb.items()},
             # device_llm_memory_mb_max is a reconstructed operational definition summarizing peak memory across device domains
@@ -212,6 +219,12 @@ class ExperimentMetrics:
             "planning_time_s": round(self.planning_time_s, 4),
             "network_waiting_time_s": round(self.network_waiting_time_s, 4),
             "simulation_computation_time_s": round(self.simulation_computation_time_s, 4),
+            "cloud_wait_s": round(self.cloud_wait_s, 4),
+            "device_wait_s": round(self.device_wait_s, 4),
+            "parser_time_s": round(self.parser_time_s, 4),
+            "simulation_time_s": round(self.simulation_time_s, 4),
+            "validation_time_s": round(self.validation_time_s, 4),
+            "run_status": self.run_status,
             "total_wall_clock_s": round(self.total_wall_clock_s, 3),
             "tfr": round(self.tfr, 4),
             "cfr": round(self.cfr, 4),
@@ -388,6 +401,12 @@ class MetricsCollector:
         consensus_skipped: int = 0,
         consensus_duration: float = 0.0,
         planner_latency: float = 0.0,
+        cloud_wait_s: float = 0.0,
+        device_wait_s: float = 0.0,
+        parser_time_s: float = 0.0,
+        simulation_time_s: float = 0.0,
+        validation_time_s: float = 0.0,
+        run_status: str = "SUCCESS",
     ) -> ExperimentMetrics:
         breakdown_dict = dict(communication_step_breakdown or {})
         paper_comm_steps = (
@@ -411,7 +430,7 @@ class MetricsCollector:
             cloud_api_calls=cloud_api_calls,
             device_api_calls=device_api_calls,
             total_api_calls=cloud_api_calls + device_api_calls,
-            device_memory_mb=device_memory_mb if device_memory_mb > 0.0 else process_peak_rss_mb,
+            device_memory_mb=device_memory_mb,
             computation_s=computation_s,
             total_wall_clock_s=total_wall_clock_s,
             tfr=float(np.mean(tfr_history)) if tfr_history else 1.0,
@@ -461,7 +480,7 @@ class MetricsCollector:
             cloud_call_attribution=dict(cloud_call_attribution or {}),
             logical_llm_requests=logical_llm_requests,
             device_inference_calls=device_inference_calls,
-            process_peak_rss_mb=process_peak_rss_mb if process_peak_rss_mb > 0.0 else device_memory_mb,
+            process_peak_rss_mb=process_peak_rss_mb,
             process_mean_rss_mb=process_mean_rss_mb,
             gpu_peak_memory_mb=gpu_peak_memory_mb,
             gpu_mean_memory_mb=gpu_mean_memory_mb,
@@ -488,6 +507,12 @@ class MetricsCollector:
             planning_time_s=planning_time_s,
             network_waiting_time_s=network_waiting_time_s,
             simulation_computation_time_s=simulation_computation_time_s,
+            cloud_wait_s=cloud_wait_s,
+            device_wait_s=device_wait_s,
+            parser_time_s=parser_time_s,
+            simulation_time_s=simulation_time_s,
+            validation_time_s=validation_time_s,
+            run_status=run_status,
             planning_latency_p50=planning_latency_p50,
             planning_latency_p95=planning_latency_p95,
             planning_latency_p99=planning_latency_p99,

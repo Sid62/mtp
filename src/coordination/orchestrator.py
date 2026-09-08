@@ -174,7 +174,7 @@ class DACAOrchestrator:
         exp_cfg = llm_cfg.get("experience_reuse", {})
         self.experience_store = SubtaskExperienceStore(
             store_path=exp_cfg.get("store_path", "experience_store.json"),
-            enabled=exp_cfg.get("enabled", False),
+            enabled=exp_cfg.get("enabled", False) if self.config.use_optimizations else False,
         )
 
         self.centralized = CentralizedHybridCoordinator(
@@ -285,6 +285,8 @@ class DACAOrchestrator:
         planning_time_s: float = 0.0
         network_waiting_time_s: float = 0.0
         simulation_computation_time_s: float = 0.0
+        validation_time_s: float = 0.0
+        simulation_time_s: float = 0.0
 
         assignments: dict = {}
         coalitions: list = []
@@ -348,7 +350,7 @@ class DACAOrchestrator:
             else:
                 mode = self.acds.mode
             architecture_switching_time_s += (time.perf_counter() - t_acds_start)
-            if step % 20 == 0:
+            if self.config.use_acds and step % 20 == 0:
                   print(
                         f"ThetaDown={self.acds.theta_down:.3f} "
                         f"ThetaUp={self.acds.theta_up:.3f}"
@@ -560,9 +562,23 @@ class DACAOrchestrator:
                 ),
                 continuity_engine=self.continuity_engine,
                 cqi_matrix=cqi_matrix,
+                is_static_baseline=(self.config.static_mode is not None),
             )
         
             if replan_now:
+                active_sids = [s.subtask_id for s in self.env.subtask_list if not s.completed]
+                arch_name = self.config.name
+                prev_valid = getattr(self._plan_state, "has_executable_plan", False)
+                affected = [t.strip() for t in replan_reason.split(':')[-1].split(',') if t.strip()] if ':' in replan_reason else []
+                print(
+                    f"\n[REPLAN_TRIGGER]\n"
+                    f"    step={step}\n"
+                    f"    reason={replan_reason}\n"
+                    f"    affected_tasks={affected}\n"
+                    f"    previous_plan_valid={prev_valid}\n"
+                    f"    active_tasks={active_sids}\n"
+                    f"    architecture={arch_name}"
+                )
                 print(f"[REPLAN] step={step} reason={replan_reason}")
                 self.cloud_llm.active_replan_reason = replan_reason
                 prev_membership = dict(self._plan_state.coalition_members)
@@ -637,26 +653,44 @@ class DACAOrchestrator:
                 coalition_computation_time_s += (time.perf_counter() - t_cfr_start)
                 cfr_history.append(cfr)
 
+            remaining_tasks = [s for s in self.env.subtask_list if not s.completed]
+            active_sids = {s.subtask_id for s in remaining_tasks}
             targets = {s.subtask_id: s.target for s in self.env.subtask_list}
             if mode == 0:
                 # AutoHMA centralized execution: consume Device LLM ExecutionDirectives
                 agent_assignments = self.centralized.extract_executable_assignments(
-                    assignments, valid_subtask_ids=set(targets.keys())
+                    assignments,
+                    valid_subtask_ids=active_sids,
+                    fleet_agent_ids={a.agent_id for a in self.env.fleet.agents},
                 )
             else:
                 agent_assignments = {}
                 for sid, agents in assignments.items():
-                    if agents:
+                    if sid in active_sids and agents:
                         agent_assignments[agents[0]] = sid
+
+            # Deterministic Assignment Validation
+            t_val_start = time.perf_counter()
+            from src.coordination.assignment_validator import AssignmentValidator
+            val_report = AssignmentValidator.filter_assignments(
+                agent_assignments,
+                self.env.fleet,
+                self.env.subtask_list,
+                check_skills=True,
+                strict_skills=False,
+                coalitions=coalitions,
+                log_diagnostics=(step == 0 or step % 50 == 0),
+            )
+            validation_time_s += (time.perf_counter() - t_val_start)
+            agent_assignments = val_report.valid_assignments
 
             # Feasibility guard: If coordinator produces 0 executable assignments on active tasks,
             # fail loudly rather than silently executing 200 empty steps.
-            remaining_tasks = [s for s in self.env.subtask_list if not s.completed]
             if len(agent_assignments) == 0 and len(remaining_tasks) > 0:
                 print(f"[FATAL] Zero executable assignments at step={step} for {len(remaining_tasks)} remaining tasks.")
                 from src.llm.exceptions import ExperimentFailed, FailureReport
                 report = FailureReport(
-                    experiment_status="FAILED",
+                    experiment_status="INVALID_PLAN",
                     failure_reason=f"Zero executable assignments at step {step}",
                     scenario=self.scenario,
                     architecture=self.config.name,
@@ -674,6 +708,8 @@ class DACAOrchestrator:
             for sid, agent_list in assignments.items():
                 if not agent_list:
                     continue
+                if not fleet.has_agent(agent_list[0]):
+                    continue
                 agent = fleet.get_agent(agent_list[0])
                 subtask = next(
                     (s for s in self.env.subtask_list if s.subtask_id == sid), None
@@ -687,10 +723,9 @@ class DACAOrchestrator:
                            f"Distance={dist(agent.position, subtask.target):.2f}"
                        )
                     from src.coordination.constants import COMPLETION_RADIUS_M
-                    if dist(agent.position, subtask.target) < COMPLETION_RADIUS_M:
-                        was_completed = subtask.completed
-                        self.env.mark_subtask_complete(sid)
-                        if not was_completed and hasattr(self, "experience_store") and self.experience_store is not None and self.experience_store.enabled:
+                    if not subtask.completed and dist(agent.position, subtask.target) < COMPLETION_RADIUS_M:
+                        transitioned = self.env.mark_subtask_complete(sid)
+                        if transitioned and hasattr(self, "experience_store") and self.experience_store is not None and self.experience_store.enabled:
                             from src.memory.experience_store import compute_signature
                             agent_types = [a.agent_type.value for a in fleet.agents]
                             d_lead = dist(agent.position, subtask.target)
@@ -705,7 +740,9 @@ class DACAOrchestrator:
                             )
 
             self.env.advance()
-            simulation_computation_time_s += (time.perf_counter() - t_sim_body)
+            step_dur = time.perf_counter() - t_sim_body
+            simulation_computation_time_s += step_dur
+            simulation_time_s += step_dur
 
             # ── AutoHMA feedback collection (centralized mode only) ──
             # Generative Agent → Device LLM review → Cloud LLM context
@@ -762,6 +799,11 @@ class DACAOrchestrator:
                 break
         
         elapsed = time.perf_counter() - start
+        if self.env.state.mission_complete or self.env.success_rate() >= 100.0:
+            run_status = "SUCCESS"
+        else:
+            run_status = "PARTIAL"
+
         device_usage = aggregate_device_usage(self.device_llms)
         peer_metrics = self.peer_manager.metrics_snapshot()
         total_llm_wait_s = self.cloud_llm.usage.llm_wait_s + device_usage.llm_wait_s
@@ -779,8 +821,8 @@ class DACAOrchestrator:
             plat_p50 = plat_p95 = plat_p99 = plat_min = plat_max = plat_std = 0.0
 
         # Memory statistics
-        peak_rss = float(np.max(process_rss_samples)) if process_rss_samples else device_usage.memory_mb
-        mean_rss = float(np.mean(process_rss_samples)) if process_rss_samples else device_usage.memory_mb
+        peak_rss = float(np.max(process_rss_samples)) if process_rss_samples else 0.0
+        mean_rss = float(np.mean(process_rss_samples)) if process_rss_samples else 0.0
 
         gpu_peak = 0.0
         gpu_mean = 0.0
@@ -799,7 +841,7 @@ class DACAOrchestrator:
             cloud_api_calls=self.cloud_llm.usage.cloud_api_calls,
             device_tokens=device_usage.total_tokens,
             device_api_calls=device_usage.device_api_calls,
-            device_memory_mb=peak_rss,
+            device_memory_mb=device_usage.memory_mb,
             computation_s=local_computation_s,
             total_wall_clock_s=elapsed,
             tfr_history=tfr_history,
@@ -909,4 +951,10 @@ class DACAOrchestrator:
             local_reasoning_count=self.decentralized.plan_reuse_count,
             cloud_reasoning_count=self._replanning_count,
             consensus_skipped=int(peer_metrics.get("consensus_skipped", 0)),
+            cloud_wait_s=self.cloud_llm.usage.llm_wait_s,
+            device_wait_s=device_usage.llm_wait_s,
+            parser_time_s=self.cloud_llm.usage.parser_time_s,
+            simulation_time_s=simulation_time_s,
+            validation_time_s=validation_time_s,
+            run_status=run_status,
         )

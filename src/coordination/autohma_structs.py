@@ -59,6 +59,154 @@ class DeviceFeedback:
         return " ".join(parts)
 
 
+RESERVED_SCHEMA_KEYS: frozenset[str] = frozenset({
+    "agent_id", "subtask_id", "task_id", "assignments", "dispatched",
+    "ack", "waypoints", "status", "action", "coalition_id", "mode",
+    "domain", "domain_id", "agents", "subtasks", "type", "members",
+    "instruction", "target", "result", "success"
+})
+
+
+def normalize_subtask_id(raw_id: Any, valid_subtask_ids: set[str] | None = None) -> str:
+    """Normalize raw subtask ID string or int into canonical format (e.g. 'T_0')."""
+    import re
+    s = str(raw_id).strip()
+    if s.startswith(("uav", "robot", "vehicle")):
+        return s
+    if valid_subtask_ids:
+        if s in valid_subtask_ids:
+            return s
+        if s.isdigit() and f"T_{s}" in valid_subtask_ids:
+            return f"T_{s}"
+        m = re.search(r"(\d+)", s)
+        if m:
+            num = m.group(1)
+            candidate = f"T_{num}"
+            if candidate in valid_subtask_ids:
+                return candidate
+            for v in valid_subtask_ids:
+                vm = re.search(r"(\d+)", v)
+                if vm and vm.group(1) == num:
+                    return v
+    if s.isdigit():
+        return f"T_{s}"
+    return s
+
+
+def normalize_device_dispatch(
+    result: Any,
+    managed_agent_ids: set[str] | None = None,
+    valid_subtask_ids: set[str] | None = None,
+) -> dict[str, str]:
+    """Normalize diverse Device LLM dispatch responses into canonical agent -> subtask mapping.
+
+    Canonical format: dict[str, str] = {agent_id: subtask_id}
+    Ensures that schema keys ('agent_id', 'subtask_id', etc.) are NEVER treated as agent IDs.
+    """
+    if not isinstance(result, (dict, list)):
+        return {}
+
+    normalized: dict[str, str] = {}
+
+    def _is_subtask_candidate(s: str) -> bool:
+        if not s or not isinstance(s, str):
+            return False
+        clean = s.strip()
+        if clean.lower() in RESERVED_SCHEMA_KEYS:
+            return False
+        if clean.startswith(("uav", "robot", "vehicle")):
+            return False
+        if valid_subtask_ids and clean in valid_subtask_ids:
+            return True
+        if clean.startswith(("T_", "subtask_")) or clean.isdigit():
+            return True
+        return False
+
+    def _is_valid_agent(aid: Any) -> bool:
+        if not aid or not isinstance(aid, str):
+            return False
+        aid_clean = aid.strip()
+        if aid_clean.lower() in RESERVED_SCHEMA_KEYS:
+            return False
+        if _is_subtask_candidate(aid_clean):
+            return False
+        if managed_agent_ids is not None and aid_clean not in managed_agent_ids:
+            return False
+        return True
+
+    def _process_record(rec: dict) -> None:
+        if not isinstance(rec, dict):
+            return
+        aid = rec.get("agent_id") or rec.get("id")
+        sid = rec.get("subtask_id") or rec.get("task_id")
+        if aid and sid:
+            aid_str = str(aid).strip()
+            if _is_valid_agent(aid_str):
+                norm_sid = normalize_subtask_id(sid, valid_subtask_ids)
+                if not valid_subtask_ids or norm_sid in valid_subtask_ids:
+                    normalized[aid_str] = norm_sid
+
+    def _process_mapping(mapping: dict) -> None:
+        if not isinstance(mapping, dict):
+            return
+        # First check if mapping itself is a Schema B record
+        if "agent_id" in mapping and ("subtask_id" in mapping or "task_id" in mapping):
+            _process_record(mapping)
+            return
+
+        for k, v in mapping.items():
+            if not isinstance(k, str):
+                continue
+            k_clean = k.strip()
+            if k_clean.lower() in RESERVED_SCHEMA_KEYS:
+                continue
+
+            # Case 1: k is a subtask ID (Schema A: {"T_6": ["uav_1"]})
+            if _is_subtask_candidate(k_clean):
+                norm_sid = normalize_subtask_id(k_clean, valid_subtask_ids)
+                if not valid_subtask_ids or norm_sid in valid_subtask_ids:
+                    agents = v if isinstance(v, list) else [v]
+                    for a in agents:
+                        if isinstance(a, str) and _is_valid_agent(a.strip()):
+                            normalized[a.strip()] = norm_sid
+                continue
+
+            # Case 2: k is an agent ID (Inverted Map: {"uav_1": "T_6"})
+            if _is_valid_agent(k_clean):
+                raw_sid = v[0] if isinstance(v, list) and v else v
+                if isinstance(raw_sid, (str, int)) and _is_subtask_candidate(str(raw_sid)):
+                    norm_sid = normalize_subtask_id(raw_sid, valid_subtask_ids)
+                    if not valid_subtask_ids or norm_sid in valid_subtask_ids:
+                        normalized[k_clean] = norm_sid
+                continue
+
+    payload: Any = result
+    if isinstance(payload, dict):
+        if len(payload) == 1:
+            k, v = next(iter(payload.items()))
+            if isinstance(v, dict) and (k.lower() in ("uav", "robot", "vehicle", "device") or "assignments" in v or "dispatched" in v):
+                payload = v
+
+    if isinstance(payload, dict):
+        if "assignments" in payload:
+            raw_assigns = payload["assignments"]
+            if isinstance(raw_assigns, list):
+                for item in raw_assigns:
+                    if isinstance(item, dict):
+                        _process_record(item)
+            elif isinstance(raw_assigns, dict):
+                _process_mapping(raw_assigns)
+            return normalized
+
+        _process_mapping(payload)
+    elif isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                _process_record(item)
+
+    return normalized
+
+
 @dataclass
 class ExecutionDirective:
     """Wrapper for Device LLM dispatch output.
@@ -79,8 +227,6 @@ class ExecutionDirective:
         """Extract assigned subtask id for a specific agent from this domain directive."""
         if agent_id in self.agent_assignments:
             return self.agent_assignments[agent_id]
-        if "assignments" in self.dispatch_result and agent_id in self.dispatch_result["assignments"]:
-            return self.dispatch_result["assignments"][agent_id]
         return None
 
 

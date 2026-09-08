@@ -530,8 +530,15 @@ class DecentralizedHybridCoordinator:
             else:
                 self.peer_manager.set_topology(agent_ids, cqi_matrix)
 
-        reused_assignments = self._try_experience_reuse(env, fleet, subtasks)
-        pending_subtasks = [s for s in subtasks if not s.completed and s.subtask_id not in reused_assignments]
+        active_subtasks = [s for s in subtasks if not s.completed]
+        active_subtasks_obs = [s for s in obs["subtasks"] if not s.get("completed", False)]
+        active_sids = {s.subtask_id for s in active_subtasks}
+
+        if not active_subtasks:
+            return {}, []
+
+        reused_assignments = self._try_experience_reuse(env, fleet, active_subtasks)
+        pending_subtasks = [s for s in active_subtasks if s.subtask_id not in reused_assignments]
 
         if reused_assignments and not pending_subtasks:
             print("[EXPERIENCE-REUSE] Decentralized reusing validated experience store assignments for all subtasks (0 LLM decomp calls)")
@@ -539,23 +546,25 @@ class DecentralizedHybridCoordinator:
         else:
             if self.use_distance_decomp and self.decomposer:
                 assignments_map = self.decomposer.decompose(
-                    obs["instruction"], fleet, subtasks
+                    obs["instruction"], fleet, active_subtasks
                 )
             else:
                 assignments_map = self.device_llm.decompose(
-                    obs["instruction"], obs["agents"], obs["subtasks"]
+                    obs["instruction"], obs["agents"], active_subtasks_obs
                 )
             if reused_assignments:
                 assignments_map.update(reused_assignments)
 
         if self.use_coalition_feasibility and self.coalition_formation:
             coalitions = self.coalition_formation.form(
-                fleet, subtasks, dist_mat, cqi_matrix
+                fleet, active_subtasks, dist_mat, cqi_matrix
             )
         else:
             coalitions = self.device_llm.form_coalitions(
-                obs["subtasks"], obs["agents"]
+                active_subtasks_obs, obs["agents"]
             )
+
+        assignments_map = {sid: aids for sid, aids in assignments_map.items() if sid in active_sids}
 
         self._local_reassign(env, assignments_map, coalitions, cqi_matrix)
 
@@ -603,5 +612,5 @@ class DecentralizedHybridCoordinator:
             agent = env.fleet.get_agent(agent_list[0])
             subtask = next((s for s in env.subtask_list if s.subtask_id == sid), None)
             from src.coordination.constants import COMPLETION_RADIUS_M
-            if subtask and dist(agent.position, subtask.target) < COMPLETION_RADIUS_M:
+            if subtask and not subtask.completed and dist(agent.position, subtask.target) < COMPLETION_RADIUS_M:
                 env.mark_subtask_complete(sid)

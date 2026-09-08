@@ -12,7 +12,10 @@ from src.control.nmpc import NMPCController
 from src.coordination.autohma_structs import (
     DeviceFeedback,
     ExecutionDirective,
+    RESERVED_SCHEMA_KEYS,
     format_feedback_for_cloud,
+    normalize_device_dispatch,
+    normalize_subtask_id,
 )
 from src.decomposition.distance_feasible_decomp import DistanceFeasibleDecomposer
 from src.env.agents import distance_matrix
@@ -105,14 +108,17 @@ class CentralizedHybridCoordinator:
         Device LLM → Generative Agent → Local Controller.
         """
         self._last_dispatch_directives.clear()
+        valid_sids = {s.subtask_id for s in subtasks if not s.completed} if subtasks else None
         for domain_id, client in self.device_llms.items():
             managed = set(client.managed_agent_ids)
             domain_coalitions = self._coalitions_for_domain(coalitions, managed, assignments_map, subtasks)
             if domain_coalitions:
                 result = client.dispatch(domain_coalitions, mode=0)
-                agent_assigns: dict[str, str] = {}
-                if isinstance(result, dict) and "assignments" in result and isinstance(result["assignments"], dict):
-                    agent_assigns = {k: str(v) for k, v in result["assignments"].items() if k in managed}
+                agent_assigns = normalize_device_dispatch(
+                    result,
+                    managed_agent_ids=managed,
+                    valid_subtask_ids=valid_sids,
+                )
                 self._last_dispatch_directives[domain_id] = ExecutionDirective(
                     domain_id=domain_id,
                     dispatch_result=result,
@@ -214,8 +220,15 @@ class CentralizedHybridCoordinator:
         if cqi_matrix is None:
             cqi_matrix = np.ones(dist_mat.shape)
 
-        reused_assignments = self._try_experience_reuse(env, fleet, subtasks)
-        pending_subtasks = [s for s in subtasks if not s.completed and s.subtask_id not in reused_assignments]
+        active_subtasks = [s for s in subtasks if not s.completed]
+        active_subtasks_obs = [s for s in obs["subtasks"] if not s.get("completed", False)]
+        active_sids = {s.subtask_id for s in active_subtasks}
+
+        if not active_subtasks:
+            return {}, [], False, False
+
+        reused_assignments = self._try_experience_reuse(env, fleet, active_subtasks)
+        pending_subtasks = [s for s in active_subtasks if s.subtask_id not in reused_assignments]
 
         # AutoHMA alignment: format Device feedback for Cloud prompt injection
         feedback_ctx = format_feedback_for_cloud(
@@ -230,13 +243,13 @@ class CentralizedHybridCoordinator:
         else:
             if self.use_distance_decomp and self.decomposer:
                 assignments_map = self.decomposer.decompose(
-                    obs["instruction"], fleet, subtasks
+                    obs["instruction"], fleet, active_subtasks
                 )
             else:
                 assignments_map = self.cloud_llm.decompose(
                     obs["instruction"],
                     obs["agents"],
-                    obs["subtasks"],
+                    active_subtasks_obs,
                     execution_feedback_context=feedback_ctx,
                 )
             if reused_assignments:
@@ -244,33 +257,39 @@ class CentralizedHybridCoordinator:
 
         if self.use_coalition_feasibility and self.coalition_formation:
             coalitions = self.coalition_formation.form(
-                fleet, subtasks, dist_mat, cqi_matrix
+                fleet, active_subtasks, dist_mat, cqi_matrix
             )
         else:
             coalitions = self.cloud_llm.form_coalitions(
-                obs["subtasks"], obs["agents"],
+                active_subtasks_obs, obs["agents"],
                 execution_feedback_context=feedback_ctx,
             )
+
+        # Filter assignments_map to active subtasks
+        assignments_map = {sid: aids for sid, aids in assignments_map.items() if sid in active_sids}
 
         cloud_reasoned = not (reused_assignments and not pending_subtasks)
 
         if self.continuity_engine is not None:
-            self.continuity_engine.set_active_plan(assignments_map, coalitions, subtasks, mode=0)
+            self.continuity_engine.set_active_plan(assignments_map, coalitions, active_subtasks, mode=0)
 
         # New plan always requires dispatch
-        self._dispatch_domains(coalitions, assignments_map, subtasks=subtasks)
+        self._dispatch_domains(coalitions, assignments_map, active_subtasks)
         self._last_dispatched_assignments = dict(assignments_map)
 
-        valid_subtask_ids = {s.subtask_id for s in subtasks if not s.completed}
         executable_assignments = self.extract_executable_assignments(
-            assignments_map, valid_subtask_ids=valid_subtask_ids
+            assignments_map,
+            valid_subtask_ids=active_sids,
+            fleet_agent_ids={a.agent_id for a in fleet.agents},
         )
 
-        # If assignments_map was empty but executable_assignments were resolved from Device directives,
+        # If Cloud LLM failed to return decomposition, but Device LLMs successfully dispatched,
         # backfill assignments_map so global tracking and plan state remain consistent.
+        valid_fleet_ids = {a.agent_id for a in fleet.agents}
         if not assignments_map and executable_assignments:
             for aid, sid in executable_assignments.items():
-                assignments_map.setdefault(sid, []).append(aid)
+                if aid in valid_fleet_ids and aid.lower() not in RESERVED_SCHEMA_KEYS:
+                    assignments_map.setdefault(sid, []).append(aid)
 
         # === B1 CENTRALIZED DEBUG & VALIDATION ===
         decomp_raw = getattr(self.cloud_llm, "last_decompose_raw", "N/A")
@@ -292,12 +311,16 @@ class CentralizedHybridCoordinator:
         print(f"EXECUTABLE_ASSIGNMENTS = {executable_assignments}")
         print("============================\n")
 
-        planned_tasks = len([s for s in subtasks if not s.completed])
-        assigned_tasks = len([sid for sid, aids in assignments_map.items() if aids])
+        total_tasks = len(subtasks)
+        completed_tasks = len([s for s in subtasks if s.completed])
+        active_planned_tasks = len(active_sids)
+        active_assigned_tasks = len([sid for sid, aids in assignments_map.items() if sid in active_sids and aids])
         executable_count = len(executable_assignments)
 
-        print(f"planned tasks = {planned_tasks}")
-        print(f"assigned tasks = {assigned_tasks}")
+        print(f"total tasks = {total_tasks}")
+        print(f"completed tasks = {completed_tasks}")
+        print(f"active planned tasks = {active_planned_tasks}")
+        print(f"active assigned tasks = {active_assigned_tasks}")
         print(f"executable assignments = {executable_count}")
 
         return assignments_map, coalitions, cloud_reasoned, True
@@ -306,66 +329,62 @@ class CentralizedHybridCoordinator:
         self,
         fallback_assignments: dict[str, list[str]],
         valid_subtask_ids: set[str] | list[str] | None = None,
+        fleet_agent_ids: set[str] | list[str] | None = None,
     ) -> dict[str, str]:
         """Extract agent -> subtask mapping consumed directly from Device LLM ExecutionDirectives.
         
         AutoHMA flow:
         Cloud Plan -> Device LLM Dispatch -> ExecutionDirective -> Agent Execution Path.
         """
-        import re
         agent_assignments: dict[str, str] = {}
         assigned_agents: set[str] = set()
+        provenance: dict[str, str] = {}
 
         valid_set = set(valid_subtask_ids) if valid_subtask_ids else set(fallback_assignments.keys())
+        valid_fleet = set(fleet_agent_ids) if fleet_agent_ids is not None else None
 
-        def _norm_sid(raw_id: Any) -> str:
-            s = str(raw_id).strip()
-            if not valid_set:
-                return s
-            if s in valid_set:
-                return s
-            if s.isdigit() and f"T_{s}" in valid_set:
-                return f"T_{s}"
-            m = re.search(r"(\d+)", s)
-            if m:
-                num = m.group(1)
-                candidate = f"T_{num}"
-                if candidate in valid_set:
-                    return candidate
-                for v in valid_set:
-                    vm = re.search(r"(\d+)", v)
-                    if vm and vm.group(1) == num:
-                        return v
-            return s
+        def _is_allowed_agent(aid: str) -> bool:
+            if not aid or not isinstance(aid, str):
+                return False
+            a_str = aid.strip()
+            if a_str.lower() in RESERVED_SCHEMA_KEYS:
+                return False
+            if valid_fleet is not None and a_str not in valid_fleet:
+                return False
+            return True
 
-        # 1. Base active subtasks from global assignments
+        # 1. Base active subtasks from global assignments (Cloud)
         for raw_sid, agents in fallback_assignments.items():
             if not agents:
                 continue
-            sid = _norm_sid(raw_sid)
+            sid = normalize_subtask_id(raw_sid, valid_set)
+            if valid_set and sid not in valid_set:
+                continue
             chosen = None
             for a in agents:
-                if a not in assigned_agents:
+                if isinstance(a, str) and _is_allowed_agent(a) and a not in assigned_agents:
                     chosen = a
                     break
-            if chosen is None:
-                chosen = agents[0]
-            agent_assignments[chosen] = sid
-            assigned_agents.add(chosen)
+            if chosen is not None:
+                agent_assignments[chosen] = sid
+                assigned_agents.add(chosen)
+                provenance[chosen] = "cloud"
 
-        # 2. Consume and apply Device LLM ExecutionDirectives
+        # 2. Consume and apply Device LLM ExecutionDirectives (Device)
         for directive in self._last_dispatch_directives.values():
             for aid, raw_sid in directive.agent_assignments.items():
-                sid = _norm_sid(raw_sid)
+                if not _is_allowed_agent(aid):
+                    continue
+                sid = normalize_subtask_id(raw_sid, valid_set)
                 if (valid_set and sid in valid_set) or (not valid_set and sid in fallback_assignments):
                     agent_assignments[aid] = sid
                     assigned_agents.add(aid)
-            if "assignments" in directive.dispatch_result and isinstance(directive.dispatch_result["assignments"], dict):
-                for aid, raw_sid in directive.dispatch_result["assignments"].items():
-                    sid = _norm_sid(raw_sid)
-                    if (valid_set and sid in valid_set) or (not valid_set and sid in fallback_assignments):
-                        agent_assignments[aid] = sid
-                        assigned_agents.add(aid)
+                    provenance[aid] = "device"
+
+        # Log assignment provenance clearly
+        for aid, sid in sorted(agent_assignments.items()):
+            src = provenance.get(aid, "unknown")
+            print(f"[ASSIGNMENT_PROVENANCE] agent={aid} task={sid} source={src}")
 
         return agent_assignments
 
@@ -380,17 +399,30 @@ class CentralizedHybridCoordinator:
         }
         # Consume Device LLM ExecutionDirectives with active subtask validation
         agent_assignments = self.extract_executable_assignments(
-            assignments, valid_subtask_ids=set(targets.keys())
+            assignments,
+            valid_subtask_ids=set(targets.keys()),
+            fleet_agent_ids={a.agent_id for a in env.fleet.agents},
         )
-        self.nmpc.step(env.fleet, agent_assignments, targets)
+        from src.coordination.assignment_validator import AssignmentValidator
+        val_report = AssignmentValidator.filter_assignments(
+            agent_assignments,
+            env.fleet,
+            env.subtask_list,
+            check_skills=True,
+            strict_skills=False,
+            log_diagnostics=False,
+        )
+        self.nmpc.step(env.fleet, val_report.valid_assignments, targets)
 
         for sid, agent_list in assignments.items():
             if not agent_list:
+                continue
+            if not env.fleet.has_agent(agent_list[0]):
                 continue
             agent = env.fleet.get_agent(agent_list[0])
             subtask = next((s for s in env.subtask_list if s.subtask_id == sid), None)
             if subtask:
                 from src.coordination.constants import COMPLETION_RADIUS_M
                 from src.env.agents import dist
-                if dist(agent.position, subtask.target) < COMPLETION_RADIUS_M:
+                if not subtask.completed and dist(agent.position, subtask.target) < COMPLETION_RADIUS_M:
                     env.mark_subtask_complete(sid)

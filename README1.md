@@ -956,7 +956,7 @@ Dataclass holding all per-run results. Method `to_dict()` serializes to JSON-fri
 | Steps | `env.state.timestep` | Simulation timesteps elapsed |
 | Tokens | `cloud_llm.usage + device_llm.usage` | LLM token counts |
 | API Calls | LLM usage counters | Total LLM invocations |
-| Memory (MB) | `device_llm.usage.memory_mb` | Static report: 4096 mock, 8192+ real |
+| Memory (MB) | `device_llm.usage.memory_mb` | Peak per-call Device-LLM RSS delta in MB across all device agents |
 | Computation (s) | `time.perf_counter()` wall clock | |
 | TFR | `compute_tfr()` history mean | Fraction of assignments passing δ feasibility |
 | CFR | `compute_cfr()` history mean | Fraction of coalitions with Γₖ ≥ Γ_min |

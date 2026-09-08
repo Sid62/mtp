@@ -25,7 +25,7 @@ This supplementary document provides a rigorous, line-by-line code audit and sci
 | Steps | Communication / coordination rounds for task decomposition & execution | steps (physical ticks) / cloud_planning_calls (coordination) | NO (Ticks vs Rounds) | Transformed: Isolate cloud_planning_calls for coordination rounds; footnote Gym movement ticks | AutoHMA-LLM reports coordination rounds (3.8-5.1). DACA-HMAS steps represents Gym physical movement timesteps (161-200). |
 | API Calls | Invocations of central planner LLM | cloud_planning_calls (Central) / api_calls (Total) | NOT DIRECTLY | Transformed: Isolate cloud_planning_calls for central planner equivalence | AutoHMA-LLM relies solely on central cloud planning calls. DACA-HMAS aggregates central Cloud LLM calls with domain-level Edge Device LLM calls. |
 | Tokens | Total prompt + completion tokens exchanged during reasoning | tokens (cloud_tokens + device_tokens) | COMPARABLE | Comparable: Report total tokens exchanged across cloud and edge tiers | Evaluates overall system LLM communication token payload across centralized decomposition and edge execution. |
-| Memory (MB) | Measured dynamic runtime RAM of classical PID/NMPC device tier (40-55 MB) | memory_mb (Google Colab 12 GB allocation limit) | NOT COMPARABLE | Not Comparable: Footnote Colab environment ceiling (~12,288 MB) | AutoHMA-LLM reports actual memory footprint of C++ classical control routines. DACA-HMAS reports fixed host/GPU allocation limit on Google Colab. |
+| Memory (MB) | Measured dynamic runtime RAM of classical PID/NMPC device tier (40-55 MB) | memory_mb (Peak per-call Device-LLM RSS delta) | COMPARABLE | Direct mapping: peak per-call RSS delta across device agents | AutoHMA-LLM reports runtime memory footprint of edge routines. DACA-HMAS reports maximum per-call resident-set-size (RSS) increase observed during Device-LLM inference across all device agents. |
 | Computation (s) | End-to-end wall-clock execution time (seconds) | computation_s | YES | Direct 1:1 mapping (time.perf_counter) | Accurately measures end-to-end mission latency from initialization to goal completion. |
 
 
@@ -41,7 +41,7 @@ Every metric reported in the experimental evaluation is traced line-by-line to i
 | Steps | steps & cloud_planning_calls | src/env/daca_env.py & src/coordination/orchestrator.py | DACAEnv.advance() (L105) / Orchestrator.run() (L439, L441) | self.state.timestep += 1 / self.cloud_llm.usage.api_calls | Movement physics ticks in Gym environment vs. Cloud LLM global decomposition call count. |
 | API Calls | cloud_planning_calls, device_planning_calls, total_api_calls | src/llm/cloud_llm_client.py, device_llm_client.py, & src/metrics/evaluation.py | CloudLLMClient.plan() (L147) / DeviceLLMClient.generate_local_plan() (L128) / EvaluationMetrics.finalize() (L122) | total_api_calls = cloud_api_calls + device_api_calls | Invocations of OpenAI/Anthropic Cloud LLM API plus Ollama/vLLM Edge Device LLM calls. |
 | Tokens | cloud_tokens, device_tokens, tokens | src/llm/cloud_llm_client.py, device_llm_client.py, & src/metrics/evaluation.py | CloudLLMClient.plan() / DeviceLLMClient.generate_local_plan() / EvaluationMetrics.finalize() (L119) | total_tokens = cloud_tokens + device_tokens | Sum of prompt tokens and completion tokens tracked across Cloud and Edge Device LLM invocations. |
-| Memory (MB) | device_memory_mb | src/llm/device_llm_client.py & src/metrics/evaluation.py | DeviceLLMClient.__init__() (L124) / EvaluationMetrics.finalize() (L123) | config.get('device', {}).get('memory_mb', 8192.0) (Max ~12288.0 MB) | Static environment allocation limit threshold on Google Colab runtime (~12 GB allocated). |
+| Memory (MB) | device_memory_mb | src/llm/device_llm_client.py & src/metrics/evaluation.py | DeviceLLMClient.complete() / aggregate_device_usage() / EvaluationMetrics.finalize() | max(rss_delta_mb_samples) | Memory (MB) is measured as the maximum per-call resident-set-size (RSS) increase observed during Device-LLM inference across all device agents. |
 | Computation (s) | computation_s | src/coordination/orchestrator.py & src/metrics/evaluation.py | Orchestrator.run() (L433) / EvaluationMetrics.finalize() (L124) | elapsed = time.perf_counter() - start | High-precision Python perf_counter wall-clock time from mission start to finish. |
 
 
@@ -61,7 +61,7 @@ To maintain strict scientific rigor, we classify all six baseline metrics into t
 - **Tokens**: Evaluates total token exchange across Cloud and Edge tiers (`cloud_tokens + device_tokens`). Comparable as a measure of total LLM payload.
 
 ### Tier C: Not Comparable (Environment Allocation Ceiling)
-- **Memory (MB)**: AutoHMA-LLM reports dynamic runtime RAM of classical control loops (40–55 MB). DACA-HMAS records `device_memory_mb` which reflects the fixed Google Colab environment allocation ceiling (~12,288 MB / 12 GB). Comparing 12 GB against 50 MB would incorrectly suggest algorithmic inefficiency; hence, Memory is classified as **Not Comparable** and footnoted as an environment limit.
+- **Memory (MB)**: Memory (MB) is measured as the maximum per-call resident-set-size (RSS) increase observed during Device-LLM inference across all device agents. This isolates the runtime memory footprint of edge agent reasoning calls rather than shared-process background memory. Shared process-wide peak memory is tracked independently in `process_peak_rss_mb`.
 
 ---
 
@@ -101,7 +101,7 @@ To maintain strict scientific rigor, we classify all six baseline metrics into t
 > *Explanation*: The AutoHMA-LLM paper defines `Steps` as high-level communication/coordination interactions (3.84–5.11). DACA-HMAS `steps` represents physical simulation movement ticks in Gym (161–200 ticks). Claiming DACA-HMAS requires 180 coordination steps would be factually incorrect; the true coordination interaction count is given by `cloud_planning_calls` (4.00–5.60) or `replanning_count`.
 
 ### Reviewer Note 3: Why Memory Metric Cannot Be Compared Directly
-> *Explanation*: The AutoHMA-LLM device tier runs classical PID/NMPC control routines consuming ~40–55 MB RAM. DACA-HMAS experiments were executed on Google Colab GPU runtimes where `memory_mb` logs the static ~12 GB allocated runtime ceiling. Interpreting 12,288 MB as algorithmic memory consumption would be misleading. We explicitly footnote this metric as an execution environment limit.
+> *Explanation*: Memory (MB) is measured as the maximum per-call resident-set-size (RSS) increase observed during Device-LLM inference across all device agents. This captures the active edge memory delta per dispatch invocation without confounding from shared process allocations. Process-wide peak memory is tracked independently via `process_peak_rss_mb`.
 
 ---
 

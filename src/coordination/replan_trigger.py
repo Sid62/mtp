@@ -69,22 +69,29 @@ def should_replan(
     
     continuity_engine: Any | None = None,
     cqi_matrix: Any | None = None,
+    is_static_baseline: bool = False,
 ) -> tuple[bool, str]:
     """Return (True, reason) iff a mission event has occurred that can
     invalidate the currently stored plan; (False, "") otherwise, in which
     case the caller MUST reuse the existing plan and MUST NOT call the
     Cloud LLM this step.
     """
+    remaining_tasks = [s for s in subtasks if not s.completed]
+    if not remaining_tasks and plan_state.initialized:
+        return False, ""
 
     # --- Trigger 1: Mission initialization / empty plan -------------------
     # No plan exists yet, or the stored plan contains 0 executable assignments,
     # so there is nothing to execute. Mark plan invalid and trigger planning.
     if not plan_state.initialized or not getattr(plan_state, "has_executable_plan", True):
+        if not remaining_tasks:
+            return False, ""
         return True, "mission_initialization" if not plan_state.initialized else "empty_or_invalid_plan"
-     # --- Trigger 1b: Architecture switch -----------------------------------
+
+    # --- Trigger 1b: Architecture switch -----------------------------------
     # Evaluate Plan Continuity on architecture switch (Centralized <-> Decentralized).
-    # If the active plan is still valid (V_plan >= threshold), preserve and continue execution!
-    if mode != plan_state.known_mode:
+    # Static baselines (B1/B2) never switch architecture.
+    if not is_static_baseline and mode != plan_state.known_mode:
         if continuity_engine is not None:
             if continuity_engine.can_continue_plan(
                 fleet, subtasks, cqi_matrix, sys_cqi, packet_loss, latency
@@ -102,40 +109,42 @@ def should_replan(
     if minimum_replanning_interval > 0 and steps_since_replan < minimum_replanning_interval:
         return False, ""
 
-    # --- Trigger 1c: Communication quality changed significantly ----------
-    # Filter high-frequency wireless noise using Exponential Moving Average (EMA)
-    # and require sustained drift over a 3-step persistence window before triggering a replan.
-    alpha = 0.3
-    if plan_state.cqi_ema is None:
-        plan_state.cqi_ema = sys_cqi
-    else:
-        plan_state.cqi_ema = alpha * sys_cqi + (1.0 - alpha) * plan_state.cqi_ema
+    # For static baselines (B1/B2), skip DACA communication-adaptive triggers (1c, 1d, 1e).
+    # Static AutoHMA baselines execute their architecture without CQI-induced dynamic replanning.
+    if not is_static_baseline:
+        # --- Trigger 1c: Communication quality changed significantly ----------
+        alpha = 0.3
+        if plan_state.cqi_ema is None:
+            plan_state.cqi_ema = sys_cqi
+        else:
+            plan_state.cqi_ema = alpha * sys_cqi + (1.0 - alpha) * plan_state.cqi_ema
 
-    cqi_delta = abs(plan_state.cqi_ema - plan_state.known_sys_cqi)
-    if cqi_delta > cqi_delta_threshold:
-        plan_state.cqi_drift_steps += 1
-        if plan_state.cqi_drift_steps >= 3:
-            # Optimization D: Check if active plan remains valid despite CQI drift
-            if continuity_engine is not None and continuity_engine.can_continue_plan(
-                fleet, subtasks, cqi_matrix, sys_cqi, packet_loss, latency
-            ):
-                return False, ""
-            return True, (
-                f"cqi_changed_significantly:{plan_state.known_sys_cqi:.3f}->{sys_cqi:.3f} (ema={plan_state.cqi_ema:.3f})"
-            )
-    else:
-        plan_state.cqi_drift_steps = 0
-    # --- Trigger 1d: Packet loss crossed threshold -------------------------
-    if (plan_state.known_packet_loss < packet_loss_threshold <= packet_loss) or (
-        plan_state.known_packet_loss >= packet_loss_threshold > packet_loss
-    ):
-        return True, f"packet_loss_crossed_threshold:{packet_loss:.3f}"
+        cqi_delta = abs(plan_state.cqi_ema - plan_state.known_sys_cqi)
+        if cqi_delta > cqi_delta_threshold:
+            plan_state.cqi_drift_steps += 1
+            if plan_state.cqi_drift_steps >= 3:
+                # Optimization D: Check if active plan remains valid despite CQI drift
+                if continuity_engine is not None and continuity_engine.can_continue_plan(
+                    fleet, subtasks, cqi_matrix, sys_cqi, packet_loss, latency
+                ):
+                    return False, ""
+                return True, (
+                    f"cqi_changed_significantly:{plan_state.known_sys_cqi:.3f}->{sys_cqi:.3f} (ema={plan_state.cqi_ema:.3f})"
+                )
+        else:
+            plan_state.cqi_drift_steps = 0
 
-    # --- Trigger 1e: Latency crossed threshold ------------------------------
-    if (plan_state.known_latency < latency_threshold <= latency) or (
-        plan_state.known_latency >= latency_threshold > latency
-    ):
-        return True, f"latency_crossed_threshold:{latency:.3f}"
+        # --- Trigger 1d: Packet loss crossed threshold -------------------------
+        if (plan_state.known_packet_loss < packet_loss_threshold <= packet_loss) or (
+            plan_state.known_packet_loss >= packet_loss_threshold > packet_loss
+        ):
+            return True, f"packet_loss_crossed_threshold:{packet_loss:.3f}"
+
+        # --- Trigger 1e: Latency crossed threshold ------------------------------
+        if (plan_state.known_latency < latency_threshold <= latency) or (
+            plan_state.known_latency >= latency_threshold > latency
+        ):
+            return True, f"latency_crossed_threshold:{latency:.3f}"
 
     # --- Trigger 1f: Agent battery crossed threshold ------------------------
     # Inert today (battery.enabled: false in config, and AgentState carries
@@ -168,6 +177,7 @@ def should_replan(
         if continuity_engine is not None and continuity_engine.can_continue_plan(
             fleet, subtasks, cqi_matrix, sys_cqi, packet_loss, latency
         ):
+            plan_state.known_completed_ids.update(newly_completed)
             return False, ""
         return True, f"task_completed_needs_reassignment:{sorted(newly_completed)}"
 
@@ -275,6 +285,7 @@ def update_plan_state(
     plan_state.known_packet_loss = packet_loss
     plan_state.known_latency = latency
     plan_state.known_subtask_ids = {s.subtask_id for s in subtasks}
+    plan_state.known_completed_ids = {s.subtask_id for s in subtasks if s.completed}
     plan_state.coalition_members = {
         c.get("coalition_id"): frozenset(c.get("members", [])) for c in coalitions
     }
