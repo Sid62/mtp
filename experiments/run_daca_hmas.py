@@ -53,12 +53,18 @@ def main() -> None:
           print(f"[FAILED] Seed {seed}: {e}")
           continue
         collector.records.append(metrics)
-        result_path = out_dir / f"{args.config}_{args.scenario}_{args.profile}_s{seed}.json"
+        def _safe_path(p: Path) -> Path:
+            p_str = str(p.resolve())
+            if sys.platform == "win32" and not p_str.startswith("\\\\?\\"):
+                return Path(f"\\\\?\\{p_str}")
+            return p
+
+        result_path = _safe_path(out_dir / f"{args.config}_{args.scenario}_{args.profile}_s{seed}.json")
         with open(result_path, "w", encoding="utf-8") as f:
             json.dump(metrics.to_dict(), f, indent=2)
         print(f"Seed {seed}: success={metrics.success_rate:.2%}, SC={metrics.switch_count}")
 
-    summary_path = out_dir / f"summary_{args.config}_{args.scenario}_{args.profile}.json"
+    summary_path = _safe_path(out_dir / f"summary_{args.config}_{args.scenario}_{args.profile}.json")
     agg = MetricsCollector.aggregate_by_config(collector.records)
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(agg, f, indent=2)

@@ -148,6 +148,15 @@ class ExperimentMetrics:
     consensus_duration: float = 0.0
     planner_latency: float = 0.0
 
+    # Phase 8 Minimal Integrity Counters
+    assignment_invariant_violations: int = 0
+    stale_assignment_resurrections: int = 0
+    provenance_mismatches: int = 0
+    parser_failures: int = 0
+    parser_retries: int = 0
+    coalition_failures: int = 0
+    fallback_count: int = 0
+
     def to_dict(self) -> dict[str, Any]:
         sem_hits = self.semantic_cache_hits
         tot_cache = sem_hits + self.cache_misses
@@ -279,6 +288,14 @@ class ExperimentMetrics:
             "consensus_skipped": self.consensus_skipped,
             "consensus_duration": round(self.consensus_duration, 4),
             "planner_latency": round(self.planner_latency, 4),
+            # Phase 8 Minimal Integrity Counters
+            "assignment_invariant_violations": self.assignment_invariant_violations,
+            "stale_assignment_resurrections": self.stale_assignment_resurrections,
+            "provenance_mismatches": self.provenance_mismatches,
+            "parser_failures": self.parser_failures,
+            "parser_retries": self.parser_retries,
+            "coalition_failures": self.coalition_failures,
+            "fallback_count": self.fallback_count,
         }
 
 
@@ -326,6 +343,14 @@ class MetricsCollector:
         experience_reuse_attempts: int = 0,
         experience_reuse_hits: int = 0,
         dispatch_skipped_rounds: int = 0,
+        # Phase 8 Minimal Integrity Counters
+        assignment_invariant_violations: int = 0,
+        stale_assignment_resurrections: int = 0,
+        provenance_mismatches: int = 0,
+        parser_failures: int = 0,
+        parser_retries: int = 0,
+        coalition_failures: int = 0,
+        fallback_count: int = 0,
         # Upgraded keyword arguments with safe defaults
         cloud_prompt_tokens: int = 0,
         cloud_completion_tokens: int = 0,
@@ -540,6 +565,14 @@ class MetricsCollector:
             consensus_skipped=consensus_skipped,
             consensus_duration=consensus_duration,
             planner_latency=planner_latency if planner_latency > 0.0 else avg_planning_latency,
+            # Phase 8 Minimal Integrity Counters
+            assignment_invariant_violations=assignment_invariant_violations,
+            stale_assignment_resurrections=stale_assignment_resurrections,
+            provenance_mismatches=provenance_mismatches,
+            parser_failures=parser_failures,
+            parser_retries=parser_retries,
+            coalition_failures=coalition_failures,
+            fallback_count=fallback_count,
         )
         self.records.append(m)
         return m

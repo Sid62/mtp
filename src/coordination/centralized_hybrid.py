@@ -22,6 +22,7 @@ from src.env.agents import distance_matrix
 from src.env.daca_env import DACAEnv
 from src.llm.cloud_llm_client import CloudLLMClient
 from src.llm.device_llm_client import DeviceLLMClient
+from src.coordination.assignment_validator import AssignmentValidator
 
 
 @dataclass
@@ -200,19 +201,36 @@ class CentralizedHybridCoordinator:
         # Plan Continuity Check: If active plan remains valid, continue execution!
         if self.continuity_engine is not None and self.continuity_engine.active_context is not None:
             if self.continuity_engine.can_continue_plan(fleet, subtasks, cqi_matrix):
-                print("[PLAN-CONTINUITY] Centralized reusing valid active plan with updated assignments (0 LLM calls)")
-                assignments = self.continuity_engine.get_updated_executable_assignments(fleet, subtasks)
+                candidate_assignments = self.continuity_engine.get_updated_executable_assignments(fleet, subtasks)
                 coalitions = self.continuity_engine.active_context.coalitions
-                # Delta dispatch: only re-dispatch if assignments actually changed
-                if assignments != self._last_dispatched_assignments:
-                    self._dispatch_domains(coalitions, assignments, subtasks=subtasks)
-                    self._last_dispatched_assignments = dict(assignments)
-                    print("[DELTA-DISPATCH] Continuity plan has changed assignments — dispatching")
-                    return assignments, coalitions, False, True
+                val_assignments, val_rep = AssignmentValidator.validate_and_clean_plan(
+                    candidate_assignments,
+                    fleet,
+                    subtasks,
+                    coalitions=coalitions,
+                    source="continuity_precheck",
+                    mode=0,
+                )
+                active_incomplete = {s.subtask_id for s in subtasks if not s.completed}
+                has_valid = any(val_assignments.get(sid) for sid in active_incomplete)
+                if not val_rep.is_valid or not has_valid:
+                    print("[PLAN-CONTINUITY] rejected: invariant violation")
+                    if val_rep.rejected_assignments:
+                        for aid, sid in val_rep.rejected_assignments.items():
+                            self.continuity_engine.active_context.rejected_mappings.add((sid, aid))
                 else:
-                    self.dispatch_skipped_count += 1
-                    print("[DELTA-DISPATCH] Assignments unchanged — skipping redundant dispatch")
-                    return assignments, coalitions, False, False
+                    print("[PLAN-CONTINUITY] Centralized reusing valid active plan with updated assignments (0 LLM calls)")
+                    assignments = val_assignments
+                    # Delta dispatch: only re-dispatch if assignments actually changed
+                    if assignments != self._last_dispatched_assignments:
+                        self._dispatch_domains(coalitions, assignments, subtasks=subtasks)
+                        self._last_dispatched_assignments = dict(assignments)
+                        print("[DELTA-DISPATCH] Continuity plan has changed assignments — dispatching")
+                        return assignments, coalitions, False, True
+                    else:
+                        self.dispatch_skipped_count += 1
+                        print("[DELTA-DISPATCH] Assignments unchanged — skipping redundant dispatch")
+                        return assignments, coalitions, False, False
 
 
         obs = env.get_observation()
@@ -268,10 +286,31 @@ class CentralizedHybridCoordinator:
         # Filter assignments_map to active subtasks
         assignments_map = {sid: aids for sid, aids in assignments_map.items() if sid in active_sids}
 
+        # Canonical plan validation: Validate and commit ONLY valid 1-to-1 assignments
+        assignments_map, val_report = AssignmentValidator.validate_and_clean_plan(
+            assignments_map,
+            fleet,
+            active_subtasks,
+            coalitions=coalitions,
+            check_skills=True,
+            strict_skills=False,
+            log_diagnostics=True,
+            source="centralized_planning",
+            mode=0,
+            step=getattr(self.cloud_llm, "current_step", 0),
+        )
+
         cloud_reasoned = not (reused_assignments and not pending_subtasks)
 
         if self.continuity_engine is not None:
-            self.continuity_engine.set_active_plan(assignments_map, coalitions, active_subtasks, mode=0)
+            self.continuity_engine.set_active_plan(
+                assignments_map,
+                coalitions,
+                active_subtasks,
+                mode=0,
+                fleet=fleet,
+                rejected_mappings={(sid, aid) for aid, sid in val_report.rejected_assignments.items()},
+            )
 
         # New plan always requires dispatch
         self._dispatch_domains(coalitions, assignments_map, active_subtasks)
@@ -353,7 +392,11 @@ class CentralizedHybridCoordinator:
                 return False
             return True
 
-        # 1. Base active subtasks from global assignments (Cloud)
+        rejected: set[tuple[str, str]] = set()
+        if self.continuity_engine is not None and self.continuity_engine.active_context is not None:
+            rejected = self.continuity_engine.active_context.rejected_mappings
+
+        # 1. Base active subtasks from global assignments (Cloud / Reallocation / Canonical)
         for raw_sid, agents in fallback_assignments.items():
             if not agents:
                 continue
@@ -362,20 +405,22 @@ class CentralizedHybridCoordinator:
                 continue
             chosen = None
             for a in agents:
-                if isinstance(a, str) and _is_allowed_agent(a) and a not in assigned_agents:
+                if isinstance(a, str) and _is_allowed_agent(a) and a not in assigned_agents and (sid, a) not in rejected:
                     chosen = a
                     break
             if chosen is not None:
                 agent_assignments[chosen] = sid
                 assigned_agents.add(chosen)
-                provenance[chosen] = "cloud"
+                provenance[chosen] = "cloud" if getattr(self, "_reallocated_task_ids", None) is None or sid not in self._reallocated_task_ids else "reallocation"
 
         # 2. Consume and apply Device LLM ExecutionDirectives (Device)
         for directive in self._last_dispatch_directives.values():
             for aid, raw_sid in directive.agent_assignments.items():
-                if not _is_allowed_agent(aid):
+                if not _is_allowed_agent(aid) or aid in assigned_agents:
                     continue
                 sid = normalize_subtask_id(raw_sid, valid_set)
+                if (sid, aid) in rejected:
+                    continue
                 if (valid_set and sid in valid_set) or (not valid_set and sid in fallback_assignments):
                     agent_assignments[aid] = sid
                     assigned_agents.add(aid)
@@ -403,7 +448,6 @@ class CentralizedHybridCoordinator:
             valid_subtask_ids=set(targets.keys()),
             fleet_agent_ids={a.agent_id for a in env.fleet.agents},
         )
-        from src.coordination.assignment_validator import AssignmentValidator
         val_report = AssignmentValidator.filter_assignments(
             agent_assignments,
             env.fleet,

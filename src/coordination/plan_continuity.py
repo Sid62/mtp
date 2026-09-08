@@ -40,6 +40,7 @@ class ActivePlanContext:
     completed_subtask_ids: set[str] = field(default_factory=set)
     subtask_targets: dict[str, tuple[float, float]] = field(default_factory=dict)
     subtask_required_skills: dict[str, set[str]] = field(default_factory=dict)
+    rejected_mappings: set[tuple[str, str]] = field(default_factory=set)
     mode: int = 0
     sys_cqi: float = 1.0
     packet_loss: float = 0.0
@@ -67,23 +68,50 @@ class PlanContinuityEngine:
         self,
         assignments: dict[str, list[str]],
         coalitions: list[dict[str, Any]],
-        subtasks: Sequence[Subtask],
-        mode: int,
+        subtasks: Sequence[Subtask] | None = None,
+        mode: int = 0,
         sys_cqi: float = 1.0,
         packet_loss: float = 0.0,
         latency: float = 0.0,
         step: int = 0,
+        fleet: AgentFleet | None = None,
+        rejected_mappings: set[tuple[str, str]] | None = None,
     ) -> None:
         """Store active global plan baseline for continuity tracking."""
-        targets = {s.subtask_id: (s.target.x, s.target.y) for s in subtasks}
-        skills = {s.subtask_id: set(s.required_skills) for s in subtasks}
-        completed = {s.subtask_id for s in subtasks if s.completed}
+        targets = {s.subtask_id: (s.target.x, s.target.y) for s in subtasks} if subtasks else {}
+        skills = {s.subtask_id: set(s.required_skills) for s in subtasks} if subtasks else {}
+        completed = {s.subtask_id for s in subtasks if s.completed} if subtasks else set()
+        
+        # Canonical validated plan commit: clean assignments if fleet is available
+        clean_assignments = {sid: list(aids) for sid, aids in assignments.items()}
+        current_rejected = set(rejected_mappings) if rejected_mappings is not None else set()
+        if fleet is not None:
+            from src.coordination.assignment_validator import AssignmentValidator
+            clean_assignments, rep = AssignmentValidator.validate_and_clean_plan(
+                clean_assignments,
+                fleet,
+                subtasks,
+                coalitions=coalitions,
+                check_skills=True,
+                log_diagnostics=False,
+                source="set_active_plan",
+                mode=mode,
+                step=step,
+            )
+            for aid, sid in rep.rejected_assignments.items():
+                current_rejected.add((sid, aid))
+
+        # Preserve existing rejected mappings across context updates
+        if self.active_context is not None and self.active_context.rejected_mappings:
+            current_rejected.update(self.active_context.rejected_mappings)
+
         self.active_context = ActivePlanContext(
-            assignments=dict(assignments),
+            assignments=clean_assignments,
             coalitions=list(coalitions),
             completed_subtask_ids=completed,
             subtask_targets=targets,
             subtask_required_skills=skills,
+            rejected_mappings=current_rejected,
             mode=mode,
             sys_cqi=sys_cqi,
             packet_loss=packet_loss,
@@ -112,6 +140,25 @@ class PlanContinuityEngine:
             return PlanValidityScore(
                 total_validity_score=1.0, validity_threshold=self.validity_threshold
             )
+
+        # Invariant checks on active plan:
+        # 1. No agent may be assigned to multiple active tasks (1-to-1 policy)
+        # 2. No completed task may have active assignments
+        # 3. No previously rejected mapping may be present
+        seen_agents: set[str] = set()
+        for sid, agents in ctx.assignments.items():
+            if not agents:
+                continue
+            if sid in ctx.completed_subtask_ids or any(s.subtask_id == sid and s.completed for s in subtasks):
+                return PlanValidityScore(
+                    total_validity_score=0.0, validity_threshold=self.validity_threshold
+                )
+            for aid in agents:
+                if aid in seen_agents or (sid, aid) in ctx.rejected_mappings:
+                    return PlanValidityScore(
+                        total_validity_score=0.0, validity_threshold=self.validity_threshold
+                    )
+                seen_agents.add(aid)
 
         # 1. Task Completion Alignment
         valid_assignments = 0
@@ -203,6 +250,9 @@ class PlanContinuityEngine:
         if not previous_assignments:
             return new_assignments
 
+        ctx = self.active_context
+        rejected = ctx.rejected_mappings if ctx is not None else set()
+
         agent_map = {a.agent_id: a for a in fleet.agents}
         locked_assignments = {sid: list(agents) for sid, agents in new_assignments.items()}
         locked_agent_ids: set[str] = set()
@@ -214,7 +264,7 @@ class PlanContinuityEngine:
             prev_agents = previous_assignments.get(sid, [])
             if prev_agents:
                 aid = prev_agents[0]
-                if aid in agent_map:
+                if aid in agent_map and (sid, aid) not in rejected and aid not in locked_agent_ids:
                     agent = agent_map[aid]
                     has_skills = (
                         not st.required_skills
@@ -230,9 +280,11 @@ class PlanContinuityEngine:
             st = next((s for s in subtasks if s.subtask_id == sid), None)
             if st and st.completed:
                 continue
-            curr_agents = [aid for aid in agents if aid not in locked_agent_ids or aid in previous_assignments.get(sid, [])]
+            curr_agents = [aid for aid in agents if (aid not in locked_agent_ids or aid in previous_assignments.get(sid, [])) and (sid, aid) not in rejected]
             if curr_agents:
-                locked_assignments[sid] = curr_agents
+                locked_assignments[sid] = [curr_agents[0]]  # 1-to-1 matching
+            else:
+                locked_assignments[sid] = []
 
         return locked_assignments
 
@@ -251,24 +303,25 @@ class PlanContinuityEngine:
         if not incomplete_subtasks:
             return {}
 
-        # 1. Filter assignments to incomplete subtasks only
+        # 1. Filter assignments to incomplete subtasks only, strictly enforcing 1-to-1 matching
         updated_assignments: dict[str, list[str]] = {}
         assigned_agents: set[str] = set()
 
         agent_map = {a.agent_id: a for a in fleet.agents}
         for s in incomplete_subtasks:
             sid = s.subtask_id
-            curr_agents = [
-                aid for aid in ctx.assignments.get(sid, [])
-                if aid in agent_map and (
-                    not s.required_skills or (set(s.required_skills) & set(agent_map[aid].skills))
-                )
-            ]
-            if curr_agents:
-                updated_assignments[sid] = curr_agents
-                assigned_agents.update(curr_agents)
-            else:
-                updated_assignments[sid] = []
+            curr_agents: list[str] = []
+            for aid in ctx.assignments.get(sid, []):
+                if (
+                    aid in agent_map
+                    and aid not in assigned_agents
+                    and (sid, aid) not in ctx.rejected_mappings
+                ):
+                    if not s.required_skills or (set(s.required_skills) & set(agent_map[aid].skills)):
+                        curr_agents.append(aid)
+                        assigned_agents.add(aid)
+                        break  # Strict 1-to-1 matching: 1 agent per task
+            updated_assignments[sid] = curr_agents
 
         # 2. Identify freed / idle agents
         all_agent_ids = set(agent_map.keys())
@@ -277,19 +330,21 @@ class PlanContinuityEngine:
         # 3. Lightweight local reassignment for freed agents to incomplete subtasks
         if freed_agents:
             for sid, agents in updated_assignments.items():
-                if not agents:
+                if not agents and bool(ctx.assignments.get(sid, [])):
                     st = next((s for s in incomplete_subtasks if s.subtask_id == sid), None)
                     if st:
-                        # Full skill match preferred
+                        # Full skill match preferred without rejected mappings
                         eligible = [
                             aid for aid in freed_agents
-                            if set(st.required_skills).issubset(set(agent_map[aid].skills)) or not st.required_skills
+                            if (sid, aid) not in ctx.rejected_mappings
+                            and (set(st.required_skills).issubset(set(agent_map[aid].skills)) or not st.required_skills)
                         ]
                         # Partial matching skills fallback (never zero matching skills)
                         if not eligible and st.required_skills:
                             eligible = [
                                 aid for aid in freed_agents
-                                if set(st.required_skills) & set(agent_map[aid].skills)
+                                if (sid, aid) not in ctx.rejected_mappings
+                                and bool(set(st.required_skills) & set(agent_map[aid].skills))
                             ]
                         if eligible:
                             best_agent = min(
@@ -297,17 +352,32 @@ class PlanContinuityEngine:
                             )
                             updated_assignments[sid] = [best_agent]
                             freed_agents.remove(best_agent)
+                            assigned_agents.add(best_agent)
 
         # 4. Apply Target Commitment Locking
         updated_assignments = self.apply_target_commitment_lock(
             updated_assignments, ctx.assignments, fleet, subtasks, lock_threshold
         )
 
-        # Update active context with newly updated execution assignments
-        ctx.assignments = updated_assignments
-        ctx.completed_subtask_ids = {s.subtask_id for s in subtasks if s.completed}
-        return updated_assignments
+        # 5. Cleanse and validate before storing
+        from src.coordination.assignment_validator import AssignmentValidator
+        cleaned_assignments, _ = AssignmentValidator.validate_and_clean_plan(
+            updated_assignments,
+            fleet,
+            subtasks,
+            coalitions=ctx.coalitions,
+            check_skills=True,
+            strict_skills=False,
+            log_diagnostics=False,
+            source="continuity_update",
+            mode=ctx.mode,
+            step=ctx.step,
+        )
 
+        # Update active context with newly updated execution assignments
+        ctx.assignments = cleaned_assignments
+        ctx.completed_subtask_ids = {s.subtask_id for s in subtasks if s.completed}
+        return cleaned_assignments
 
     def can_continue_plan(
         self,
@@ -318,7 +388,7 @@ class PlanContinuityEngine:
         packet_loss: float = 0.0,
         latency: float = 0.0,
     ) -> bool:
-        """Return True if active plan validity score exceeds threshold."""
+        """Return True if active plan validity score exceeds threshold and executable state is valid."""
         if self.active_context is None:
             return False
 
@@ -329,6 +399,16 @@ class PlanContinuityEngine:
             return False
 
         # Dynamically refresh Layer 2 execution assignments for incomplete subtasks
-        self.get_updated_executable_assignments(fleet, subtasks)
+        updated = self.get_updated_executable_assignments(fleet, subtasks)
+        incomplete = [s for s in subtasks if not s.completed]
+        if incomplete:
+            # Must provide at least one executable assignment for incomplete tasks
+            has_exec = any(
+                len(agents) > 0 for sid, agents in updated.items()
+                if any(s.subtask_id == sid for s in incomplete)
+            )
+            if not has_exec:
+                return False
+
         return True
 

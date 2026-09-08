@@ -216,10 +216,26 @@ class DeviceLLMClient:
             before = self.usage.device_api_calls
             provider = self.config.get("device", {}).get("provider", "ollama")
             start = time.perf_counter()
-            if provider == "vllm":
-                response, p_tok, c_tok, t_tok = self._vllm_call(prompt)
+            if provider in getattr(DeviceLLMClient, "_provider_unreachable", set()):
+                response = self._mock_response(prompt)
+                p_tok = len(prompt.split())
+                c_tok = len(response.split())
+                t_tok = p_tok + c_tok
             else:
-                response, p_tok, c_tok, t_tok = self._ollama_call(prompt)
+                try:
+                    if provider == "vllm":
+                        response, p_tok, c_tok, t_tok = self._vllm_call(prompt)
+                    else:
+                        response, p_tok, c_tok, t_tok = self._ollama_call(prompt)
+                except Exception as exc:
+                    print(f"[DEVICE-LLM-FALLBACK] Provider {provider} failed ({type(exc).__name__}: {exc}). Falling back to mock reasoning.")
+                    if not hasattr(DeviceLLMClient, "_provider_unreachable"):
+                        DeviceLLMClient._provider_unreachable = set()
+                    DeviceLLMClient._provider_unreachable.add(provider)
+                    response = self._mock_response(prompt)
+                    p_tok = len(prompt.split())
+                    c_tok = len(response.split())
+                    t_tok = p_tok + c_tok
             elapsed = time.perf_counter() - start
             self.usage.prompt_tokens += p_tok
             self.usage.completion_tokens += c_tok
@@ -272,7 +288,7 @@ class DeviceLLMClient:
               f"prompt_chars={prompt_chars} approx_tokens={approx_tokens}")
 
         t_start = time.perf_counter()
-        with httpx.Client(timeout=timeout_s) as client:
+        with httpx.Client(timeout=httpx.Timeout(timeout_s, connect=0.5)) as client:
             resp = client.post(
                 f"{base_url}/api/generate",
                 json={
@@ -307,7 +323,7 @@ class DeviceLLMClient:
         device = self.config["device"]
         base_url = device.get("base_url", "http://localhost:8000/v1")
         model = device.get("model", "meta-llama/Llama-3.1-8B-Instruct")
-        with httpx.Client(timeout=520.0) as client:
+        with httpx.Client(timeout=httpx.Timeout(520.0, connect=0.5)) as client:
             resp = client.post(
                 f"{base_url}/chat/completions",
                 json={

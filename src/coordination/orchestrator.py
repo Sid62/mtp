@@ -217,6 +217,8 @@ class DACAOrchestrator:
         self.metrics = MetricsCollector()
         self.comm_counter = CommunicationStepCounter()
         self._plan_state = PlanState()
+        self.fallback_count = 0
+        self.provenance_mismatches = 0
 
     @property
     def device_llm(self) -> DeviceLLMClient:
@@ -226,6 +228,8 @@ class DACAOrchestrator:
         return next(iter(self.device_llms.values()))
     
     def _device_fallback_decompose(self, instruction, agents, subtasks):
+        self.fallback_count += 1
+        print("[FALLBACK] Using device fallback for task decomposition")
         client = self.device_llm
         n = len(agents)
         dist_mat = [[0.0] * n for _ in range(n)]
@@ -243,10 +247,164 @@ class DACAOrchestrator:
         return assignments
 
     def _device_fallback_coalitions(self, subtasks, agents, distance_matrix, cqi_matrix):
+        self.fallback_count += 1
+        print("[FALLBACK] Using device fallback for coalition planning")
         client = self.device_llm
         dmat = distance_matrix if distance_matrix is not None else [[0.0] * len(agents)] * len(agents)
         qmat = cqi_matrix if cqi_matrix is not None else [[1.0] * len(agents)] * len(agents)
         return client.reallocate_remaining(subtasks, agents, dmat, qmat, scope_to_managed=False)
+
+    def validate_execution_state(
+        self,
+        agent_assignments: dict[str, str],
+        canonical_active_plan: dict[str, list[str]],
+        rejected_mappings: set[tuple[str, str]],
+        step: int,
+        mode: int,
+        source: str = "pre_execution",
+    ) -> list[str]:
+        """Centrally assert the 10 execution state invariants before simulator stepping (Requirement 8)."""
+        violations: list[str] = []
+        fleet = self.env.fleet
+        subtasks = self.env.subtask_list
+        fleet_agents = {a.agent_id for a in fleet.agents}
+        subtask_map = {s.subtask_id: s for s in subtasks}
+        completed_sids = {s.subtask_id for s in subtasks if s.completed}
+
+        # 1. No INVALID assignment in execution
+        for aid, sid in agent_assignments.items():
+            if (sid, aid) in rejected_mappings:
+                msg = (
+                    f"[STATE-INVARIANT-VIOLATION] step={step} mode={mode} task={sid} agent={aid} source={source} "
+                    f"expected_state='valid' actual_state='invalid' reason='rejected_assignment_in_execution'"
+                )
+                print(msg)
+                violations.append(msg)
+                self.active_invalid_assignments += 1
+                self.assignment_invariant_violations += 1
+
+        # 2. No unresolved assignment in execution
+        for aid, sid in agent_assignments.items():
+            if not aid or not sid:
+                msg = (
+                    f"[STATE-INVARIANT-VIOLATION] step={step} mode={mode} task={sid} agent={aid} source={source} "
+                    f"expected_state='resolved' actual_state='unresolved' reason='unresolved_assignment_in_execution'"
+                )
+                print(msg)
+                violations.append(msg)
+                self.assignment_invariant_violations += 1
+
+        # 3. No completed task in execution
+        for aid, sid in agent_assignments.items():
+            if sid in completed_sids:
+                msg = (
+                    f"[STATE-INVARIANT-VIOLATION] step={step} mode={mode} task={sid} agent={aid} source={source} "
+                    f"expected_state='active' actual_state='completed' reason='completed_task_in_execution'"
+                )
+                print(msg)
+                violations.append(msg)
+                self.completed_tasks_reintroduced += 1
+                self.assignment_invariant_violations += 1
+
+        # 4. No agent assigned to >1 active task in canonical active plan
+        seen_agents: dict[str, str] = {}
+        for sid, aids in canonical_active_plan.items():
+            if sid in completed_sids:
+                continue
+            for aid in aids:
+                if aid in seen_agents:
+                    msg = (
+                        f"[STATE-INVARIANT-VIOLATION] step={step} mode={mode} task={sid} agent={aid} source={source} "
+                        f"expected_state='single_assigned' actual_state='multiple_assigned' reason='agent_multiply_assigned:{seen_agents[aid]},{sid}'"
+                    )
+                    print(msg)
+                    violations.append(msg)
+                    self.assignment_invariant_violations += 1
+                else:
+                    seen_agents[aid] = sid
+
+        # 5. Every execution agent exists
+        for aid, sid in agent_assignments.items():
+            if aid not in fleet_agents:
+                msg = (
+                    f"[STATE-INVARIANT-VIOLATION] step={step} mode={mode} task={sid} agent={aid} source={source} "
+                    f"expected_state='existing_agent' actual_state='nonexistent' reason='agent_does_not_exist:{aid}'"
+                )
+                print(msg)
+                violations.append(msg)
+                self.assignment_invariant_violations += 1
+
+        # 6. Every execution task exists
+        for aid, sid in agent_assignments.items():
+            if sid not in subtask_map:
+                msg = (
+                    f"[STATE-INVARIANT-VIOLATION] step={step} mode={mode} task={sid} agent={aid} source={source} "
+                    f"expected_state='existing_task' actual_state='nonexistent' reason='task_does_not_exist:{sid}'"
+                )
+                print(msg)
+                violations.append(msg)
+                self.assignment_invariant_violations += 1
+
+        # 7. Active plan == executable assignments semantically
+        for aid, sid in agent_assignments.items():
+            if sid not in canonical_active_plan or aid not in canonical_active_plan[sid]:
+                msg = (
+                    f"[STATE-INVARIANT-VIOLATION] step={step} mode={mode} task={sid} agent={aid} source={source} "
+                    f"expected_state='in_canonical_active_plan' actual_state='not_in_canonical_active_plan' reason='active_plan_mismatch:{sid}->{aid}'"
+                )
+                print(msg)
+                violations.append(msg)
+                self.state_provenance_mismatches += 1
+                self.provenance_mismatches += 1
+                self.assignment_invariant_violations += 1
+
+        # 8. Continuity plan == canonical active plan semantically
+        if self.continuity_engine and self.continuity_engine.active_context:
+            cont_assignments = self.continuity_engine.active_context.assignments
+            for sid, aids in canonical_active_plan.items():
+                if sid in completed_sids:
+                    continue
+                cont_aids = cont_assignments.get(sid, [])
+                if aids and cont_aids and set(aids) != set(cont_aids):
+                    msg = (
+                        f"[STATE-INVARIANT-VIOLATION] step={step} mode={mode} task={sid} agent={','.join(aids)} source={source} "
+                        f"expected_state='{aids}' actual_state='{cont_aids}' reason='continuity_plan_semantic_mismatch'"
+                    )
+                    print(msg)
+                    violations.append(msg)
+                    self.stale_assignment_resurrections += 1
+                    self.assignment_invariant_violations += 1
+
+        # 9. Assignment provenance corresponds to actual active assignment
+        for aid, sid in agent_assignments.items():
+            if (sid, aid) in rejected_mappings:
+                msg = (
+                    f"[STATE-INVARIANT-VIOLATION] step={step} mode={mode} task={sid} agent={aid} source={source} "
+                    f"expected_state='valid_provenance' actual_state='stale_provenance' reason='assignment_provenance_mismatch'"
+                )
+                print(msg)
+                violations.append(msg)
+                self.state_provenance_mismatches += 1
+                self.provenance_mismatches += 1
+                self.assignment_invariant_violations += 1
+
+        # 10. Reallocation state does not claim an assignment is active when it is not
+        if hasattr(self, "centralized") and self.centralized and mode == 0:
+            directives = getattr(self.centralized, "_last_dispatch_directives", {})
+            if isinstance(directives, dict):
+                for directive in directives.values():
+                    if hasattr(directive, "agent_assignments"):
+                        for aid, sid in directive.agent_assignments.items():
+                            if sid in completed_sids or (sid, aid) in rejected_mappings:
+                                msg = (
+                                    f"[STATE-INVARIANT-VIOLATION] step={step} mode={mode} task={sid} agent={aid} source={source} "
+                                    f"expected_state='valid_directive' actual_state='invalid_or_completed_directive' reason='stale_dispatch_directive'"
+                                )
+                                print(msg)
+                                violations.append(msg)
+                                self.assignment_invariant_violations += 1
+
+        return violations
 
     def run(self) -> ExperimentMetrics:
         import inspect
@@ -296,7 +454,18 @@ class DACAOrchestrator:
         validation_time_s: float = 0.0
         simulation_time_s: float = 0.0
 
+        self.assignment_invariant_violations = 0
+        self.continuity_resurrections = 0
+        self.stale_assignment_resurrections = 0
+        self.active_invalid_assignments = 0
+        self.completed_tasks_reintroduced = 0
+        self.state_provenance_mismatches = 0
+        self.provenance_mismatches = 0
+        self.fallback_count = 0
+
         assignments: dict = {}
+        canonical_active_plan: dict[str, list[str]] = {}
+        rejected_mappings: set[tuple[str, str]] = set()
         coalitions: list = []
         tfr_history: list[float] = []
         cfr_history: list[float] = []
@@ -423,6 +592,24 @@ class DACAOrchestrator:
                     + (t_transfer_end - t_transfer_start)
                 )
 
+            if mode != prev_mode:
+                # Phase 2 & 6: Validate current committed active state after mode transition
+                assignments, trans_report = AssignmentValidator.validate_and_clean_plan(
+                    assignments,
+                    fleet,
+                    self.env.subtask_list,
+                    coalitions=coalitions,
+                    source="mode_transition",
+                    mode=mode,
+                    step=step,
+                )
+                if trans_report.rejected_assignments:
+                    for aid, sid in trans_report.rejected_assignments.items():
+                        rejected_mappings.add((sid, aid))
+                canonical_active_plan = {k: list(v) for k, v in assignments.items()}
+                if self.continuity_engine and self.continuity_engine.active_context:
+                    self.continuity_engine.active_context.rejected_mappings.update(rejected_mappings)
+
                 if self.config.use_reallocation and self.reallocator.should_trigger(
                     True,
                     coalitions,
@@ -467,7 +654,7 @@ class DACAOrchestrator:
 
                         # Pass 1: skill-matching agents within R_reach
                         for aid in all_coalition_agents:
-                            if aid in assigned_agents:
+                            if aid in assigned_agents or (st.subtask_id, aid) in rejected_mappings:
                                 continue
                             if not fleet.has_agent(aid):
                                 continue
@@ -485,7 +672,7 @@ class DACAOrchestrator:
                         # Pass 2 (fallback): skill-matching but beyond R_reach
                         if best_aid is None:
                             for aid in all_coalition_agents:
-                                if aid in assigned_agents:
+                                if aid in assigned_agents or (st.subtask_id, aid) in rejected_mappings:
                                     continue
                                 if not fleet.has_agent(aid):
                                     continue
@@ -497,11 +684,14 @@ class DACAOrchestrator:
                                 if d < best_d:
                                     best_d = d
                                     best_aid = aid
+                            if best_aid is not None:
+                                self.fallback_count += 1
+                                print(f"[FALLBACK] Reallocation Pass 2: assigning agent {best_aid} beyond R_reach for subtask {st.subtask_id}")
 
                         # Pass 2b: partial skill-matching agents (at least one matching skill)
                         if best_aid is None and required:
                             for aid in all_coalition_agents:
-                                if aid in assigned_agents:
+                                if aid in assigned_agents or (st.subtask_id, aid) in rejected_mappings:
                                     continue
                                 if not fleet.has_agent(aid):
                                     continue
@@ -513,6 +703,9 @@ class DACAOrchestrator:
                                 if d < best_d:
                                     best_d = d
                                     best_aid = aid
+                            if best_aid is not None:
+                                self.fallback_count += 1
+                                print(f"[FALLBACK] Reallocation Pass 2b: assigning agent {best_aid} with partial skills for subtask {st.subtask_id}")
 
                         # INVARIANT 7 & 8: No nearest-agent fallback without skill match.
                         # If no valid agent exists, task remains explicitly UNRESOLVED.
@@ -535,6 +728,7 @@ class DACAOrchestrator:
                                 if fleet.has_agent(a)
                                 and (not required or bool(required & agent_skills.get(a, set())))
                                 and a not in assigned_agents
+                                and (st.subtask_id, a) not in rejected_mappings
                             ]
                             if prior_aids:
                                 new_assignments[st.subtask_id] = [prior_aids[0]]
@@ -545,7 +739,7 @@ class DACAOrchestrator:
                             new_assignments[st.subtask_id] = []
 
                     # Revalidate and clean reallocation assignments
-                    new_assignments, _ = AssignmentValidator.validate_and_clean_plan(
+                    new_assignments, realloc_report = AssignmentValidator.validate_and_clean_plan(
                         new_assignments,
                         fleet,
                         self.env.subtask_list,
@@ -554,7 +748,17 @@ class DACAOrchestrator:
                         mode=mode,
                         step=step,
                     )
+                    if realloc_report.rejected_assignments:
+                        for aid, sid in realloc_report.rejected_assignments.items():
+                            rejected_mappings.add((sid, aid))
                     assignments = new_assignments
+                    canonical_active_plan = {k: list(v) for k, v in assignments.items()}
+                    if self.continuity_engine and self.continuity_engine.active_context:
+                        self.continuity_engine.active_context.assignments = {k: list(v) for k, v in assignments.items()}
+                        self.continuity_engine.active_context.rejected_mappings.update(rejected_mappings)
+                    if hasattr(self, "centralized") and self.centralized:
+                        self.centralized._last_dispatched_assignments = {k: list(v) for k, v in assignments.items()}
+                        self.centralized._last_dispatch_directives.clear()
                     valid_keys = [k for k, v in assignments.items() if v]
                     print(
                         f"[REALLOC] Propagated validated assignments: {valid_keys}"
@@ -658,6 +862,22 @@ class DACAOrchestrator:
                 if new_membership != prev_membership:
                     self._coalition_change_count += 1
 
+                assignments, plan_report = AssignmentValidator.validate_and_clean_plan(
+                    assignments,
+                    fleet,
+                    self.env.subtask_list,
+                    coalitions=coalitions,
+                    source="centralized_plan" if mode == 0 else "decentralized_plan",
+                    mode=mode,
+                    step=step,
+                )
+                if plan_report.rejected_assignments:
+                    for aid, sid in plan_report.rejected_assignments.items():
+                        rejected_mappings.add((sid, aid))
+                canonical_active_plan = {k: list(v) for k, v in assignments.items()}
+                if self.continuity_engine and self.continuity_engine.active_context:
+                    self.continuity_engine.active_context.rejected_mappings.update(rejected_mappings)
+
                 update_plan_state(
                     self._plan_state,
                     self.env.subtask_list,
@@ -675,7 +895,7 @@ class DACAOrchestrator:
                 if self.continuity_engine is not None and self.continuity_engine.active_context is not None:
                     # Sync updated assignments from continuity engine
                     assignments = self.continuity_engine.get_updated_executable_assignments(fleet, self.env.subtask_list)
-                    assignments, _ = AssignmentValidator.validate_and_clean_plan(
+                    assignments, reuse_report = AssignmentValidator.validate_and_clean_plan(
                         assignments,
                         fleet,
                         self.env.subtask_list,
@@ -684,6 +904,11 @@ class DACAOrchestrator:
                         mode=mode,
                         step=step,
                     )
+                    if reuse_report.rejected_assignments:
+                        for aid, sid in reuse_report.rejected_assignments.items():
+                            rejected_mappings.add((sid, aid))
+                            self.continuity_resurrections += 1
+                    canonical_active_plan = {k: list(v) for k, v in assignments.items()}
 
             print(f"\n[ASSIGN] Step={step}")
             for sid, agents in assignments.items():
@@ -742,10 +967,22 @@ class DACAOrchestrator:
             # Phase 5: Clean master assignments after invalidation
             if val_report.rejected_assignments:
                 for aid, sid in val_report.rejected_assignments.items():
+                    rejected_mappings.add((sid, aid))
                     if sid in assignments and aid in assignments[sid]:
                         assignments[sid].remove(aid)
                     if sid in assignments and not assignments[sid]:
                         assignments[sid] = []
+                    if sid in canonical_active_plan and aid in canonical_active_plan[sid]:
+                        canonical_active_plan[sid].remove(aid)
+                    if self.continuity_engine and self.continuity_engine.active_context:
+                        self.continuity_engine.active_context.rejected_mappings.add((sid, aid))
+                        if sid in self.continuity_engine.active_context.assignments:
+                            if aid in self.continuity_engine.active_context.assignments[sid]:
+                                self.continuity_engine.active_context.assignments[sid].remove(aid)
+                    if hasattr(self, "centralized") and self.centralized:
+                        if sid in self.centralized._last_dispatched_assignments:
+                            if aid in self.centralized._last_dispatched_assignments[sid]:
+                                self.centralized._last_dispatched_assignments[sid].remove(aid)
 
             # Phase 9: State-aware zero executable assignments recovery
             if len(agent_assignments) == 0 and len(remaining_tasks) > 0:
@@ -775,6 +1012,23 @@ class DACAOrchestrator:
                     self._planning_latency_total += plan_lat
                     self._planning_latency_count += 1
                     self._replanning_count += 1
+
+                    assignments, rec_report = AssignmentValidator.validate_and_clean_plan(
+                        assignments,
+                        fleet,
+                        self.env.subtask_list,
+                        coalitions=coalitions,
+                        source="recovery_plan",
+                        mode=mode,
+                        step=step,
+                    )
+                    if rec_report.rejected_assignments:
+                        for aid, sid in rec_report.rejected_assignments.items():
+                            rejected_mappings.add((sid, aid))
+                    canonical_active_plan = {k: list(v) for k, v in assignments.items()}
+                    if self.continuity_engine and self.continuity_engine.active_context:
+                        self.continuity_engine.active_context.rejected_mappings.update(rejected_mappings)
+
                     update_plan_state(
                         self._plan_state,
                         self.env.subtask_list,
@@ -812,6 +1066,20 @@ class DACAOrchestrator:
                         step=step,
                     )
                     agent_assignments = val_report.valid_assignments
+                    if val_report.rejected_assignments:
+                        for aid, sid in val_report.rejected_assignments.items():
+                            rejected_mappings.add((sid, aid))
+                            if sid in assignments and aid in assignments[sid]:
+                                assignments[sid].remove(aid)
+                            if sid in assignments and not assignments[sid]:
+                                assignments[sid] = []
+                            if sid in canonical_active_plan and aid in canonical_active_plan[sid]:
+                                canonical_active_plan[sid].remove(aid)
+                            if self.continuity_engine and self.continuity_engine.active_context:
+                                self.continuity_engine.active_context.rejected_mappings.add((sid, aid))
+                                if sid in self.continuity_engine.active_context.assignments:
+                                    if aid in self.continuity_engine.active_context.assignments[sid]:
+                                        self.continuity_engine.active_context.assignments[sid].remove(aid)
 
                 # Feasibility guard: If coordinator produces 0 executable assignments after recovery, fail explicitly.
                 if len(agent_assignments) == 0 and len(remaining_tasks) > 0:
@@ -835,6 +1103,10 @@ class DACAOrchestrator:
                 agent_assignments, fleet, self.env.subtask_list,
                 source="pre_execution", mode=mode, step=step,
                 coalitions=coalitions,
+            )
+            self.validate_execution_state(
+                agent_assignments, canonical_active_plan, rejected_mappings,
+                step=step, mode=mode, source="pre_execution"
             )
 
             t_sim_body = time.perf_counter()
@@ -864,11 +1136,18 @@ class DACAOrchestrator:
                         if transitioned:
                             # Invariants 3, 9, 11: Atomically purge completed task from all active structures
                             assignments.pop(sid, None)
+                            canonical_active_plan.pop(sid, None)
                             if self.continuity_engine and self.continuity_engine.active_context:
                                 self.continuity_engine.active_context.completed_subtask_ids.add(sid)
                                 self.continuity_engine.active_context.assignments.pop(sid, None)
                             if hasattr(self, "centralized") and self.centralized:
                                 self.centralized._last_dispatched_assignments.pop(sid, None)
+                                if isinstance(self.centralized._last_dispatch_directives, dict):
+                                    for directive in self.centralized._last_dispatch_directives.values():
+                                        if hasattr(directive, "agent_assignments"):
+                                            directive.agent_assignments = {
+                                                aid: task for aid, task in directive.agent_assignments.items() if task != sid
+                                            }
                             if hasattr(self, "decentralized") and self.decentralized:
                                 for sp in self.decentralized.shared_plans.values():
                                     sp.subtasks = [
@@ -912,6 +1191,12 @@ class DACAOrchestrator:
                                     skills=subtask.required_skills,
                                     agent_types=agent_types,
                                 )
+
+            # Phase 2 & 7: Purge completed tasks from active state after completion
+            completed_sids = {s.subtask_id for s in self.env.subtask_list if s.completed}
+            for csid in completed_sids:
+                assignments.pop(csid, None)
+                canonical_active_plan.pop(csid, None)
 
             self.env.advance()
             step_dur = time.perf_counter() - t_sim_body
@@ -966,9 +1251,9 @@ class DACAOrchestrator:
             if step % 20 == 0:
                 print(
                     f"[MISSION] Step={step} "
-                    f"Completed={self.env.success_rate():.2f}% "
+                    f"Completed={self.env.success_rate() * 100:.1f}% ({len(self.env.state.completed_subtasks)}/{len(self.env.subtask_list)}) "
                     f"MissionDone={self.env.state.mission_complete}"
-       )
+                )
             if self.env.state.mission_complete:
                 break
         
@@ -1008,7 +1293,40 @@ class DACAOrchestrator:
         except ImportError:
             pass
 
+        parser_failures = getattr(self.cloud_llm.usage, "parse_failures", 0) + sum(
+            getattr(d.usage, "failed_calls", 0) for d in self.device_llms.values() if hasattr(d, "usage")
+        )
+        parser_retries = (
+            getattr(self.cloud_llm.usage, "coalition_retry_calls", 0)
+            + getattr(self.cloud_llm.usage, "hallucination_retry_calls", 0)
+            + self.cloud_llm.hallucination_stats.get("retry_attempts", 0)
+        )
+        coalition_failures = self.cloud_llm.hallucination_stats.get("form_coalitions_failure_count", 0)
+        fallback_count = getattr(self, "fallback_count", 0)
+
+        print("\n" + "=" * 50)
+        print("SCIENTIFIC EXECUTION INTEGRITY AUDIT REPORT")
+        print("=" * 50)
+        print(f"assignment_invariant_violations = {self.assignment_invariant_violations}")
+        print(f"stale_assignment_resurrections = {self.stale_assignment_resurrections}")
+        print(f"provenance_mismatches = {self.provenance_mismatches}")
+        print(f"parser_failures = {parser_failures}")
+        print(f"parser_retries = {parser_retries}")
+        print(f"coalition_failures = {coalition_failures}")
+        print(f"fallback_count = {fallback_count}")
+        print(f"continuity_resurrections = {self.continuity_resurrections}")
+        print(f"active_invalid_assignments = {self.active_invalid_assignments}")
+        print(f"completed_tasks_reintroduced = {self.completed_tasks_reintroduced}")
+        print("=" * 50 + "\n")
+
         return self.metrics.finalize(
+            assignment_invariant_violations=self.assignment_invariant_violations,
+            stale_assignment_resurrections=self.stale_assignment_resurrections,
+            provenance_mismatches=self.provenance_mismatches,
+            parser_failures=parser_failures,
+            parser_retries=parser_retries,
+            coalition_failures=coalition_failures,
+            fallback_count=fallback_count,
             success_rate=self.env.success_rate(),
             steps=self.env.state.timestep,
             cloud_tokens=self.cloud_llm.usage.total_tokens,

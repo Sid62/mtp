@@ -22,6 +22,7 @@ from src.env.agents import AgentFleet, distance_matrix, dist
 from src.env.daca_env import DACAEnv
 from src.llm.cloud_llm_client import CloudLLMClient
 from src.llm.device_llm_client import DeviceLLMClient
+from src.coordination.assignment_validator import AssignmentValidator
 
 
 @dataclass
@@ -515,10 +516,27 @@ class DecentralizedHybridCoordinator:
         # Plan Continuity Check: If active plan remains valid, continue execution!
         if self.continuity_engine is not None and self.continuity_engine.active_context is not None:
             if self.continuity_engine.can_continue_plan(fleet, subtasks, cqi_matrix):
-                print("[PLAN-CONTINUITY] Decentralized reusing valid active plan with updated assignments (0 LLM calls)")
-                assignments = self.continuity_engine.get_updated_executable_assignments(fleet, subtasks)
+                candidate_assignments = self.continuity_engine.get_updated_executable_assignments(fleet, subtasks)
                 coalitions = self.continuity_engine.active_context.coalitions
-                return assignments, coalitions, False
+                val_assignments, val_rep = AssignmentValidator.validate_and_clean_plan(
+                    candidate_assignments,
+                    fleet,
+                    subtasks,
+                    coalitions=coalitions,
+                    source="continuity_precheck",
+                    mode=1,
+                )
+                active_incomplete = {s.subtask_id for s in subtasks if not s.completed}
+                has_valid = any(val_assignments.get(sid) for sid in active_incomplete)
+                if not val_rep.is_valid or not has_valid:
+                    print("[PLAN-CONTINUITY] rejected: invariant violation")
+                    if val_rep.rejected_assignments:
+                        for aid, sid in val_rep.rejected_assignments.items():
+                            self.continuity_engine.active_context.rejected_mappings.add((sid, aid))
+                else:
+                    print("[PLAN-CONTINUITY] Decentralized reusing valid active plan with updated assignments (0 LLM calls)")
+                    assignments = val_assignments
+                    return assignments, coalitions, False
 
 
         obs = env.get_observation()
@@ -594,8 +612,29 @@ class DecentralizedHybridCoordinator:
                 coalitions, self._fleet_observations(env)
             )
 
+        # Validate and commit ONLY valid 1-to-1 assignments
+        assignments_map, val_report = AssignmentValidator.validate_and_clean_plan(
+            assignments_map,
+            fleet,
+            subtasks,
+            coalitions=coalitions,
+            check_skills=True,
+            strict_skills=False,
+            log_diagnostics=True,
+            source="decentralized_planning",
+            mode=1,
+            step=getattr(self.device_llm, "current_step", 0),
+        )
+
         if self.continuity_engine is not None:
-            self.continuity_engine.set_active_plan(assignments_map, coalitions, subtasks, mode=1)
+            self.continuity_engine.set_active_plan(
+                assignments_map,
+                coalitions,
+                subtasks,
+                mode=1,
+                fleet=fleet,
+                rejected_mappings={(sid, aid) for aid, sid in val_report.rejected_assignments.items()},
+            )
 
         return assignments_map, coalitions, True
 
