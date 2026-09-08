@@ -108,12 +108,6 @@ class DeviceLLMClient:
     def __post_init__(self) -> None:
         if not tracemalloc.is_tracing():
             tracemalloc.start()
-
-    @property
-    def domain_id(self) -> str:
-        return self.node_id
-
-    def __post_init__(self) -> None:
         if self.node_state is None:
             managed = list(self.managed_agent_ids) or [self.node_id]
             self.node_state = NodeState(node_id=self.node_id, managed_agent_ids=managed)
@@ -127,6 +121,10 @@ class DeviceLLMClient:
             else:
                 self.managed_agent_ids = [self.node_id]
                 self.node_state.managed_agent_ids = [self.node_id]
+
+    @property
+    def domain_id(self) -> str:
+        return self.node_id
 
     @classmethod
     def for_domain(
@@ -500,13 +498,112 @@ class DeviceLLMClient:
             return parsed
         return self._mock_coalitions_from_inputs(agents)
 
-    def _parse_json_response(self, raw: str) -> dict[str, Any]:
+    @staticmethod
+    def _clean_llm_text(raw: str) -> str:
+        """Strip reasoning wrappers like <think> or conversational preambles."""
+        import re
+        text = re.sub(r"<(?:think|thought)>.*?</(?:think|thought)>", "", raw, flags=re.DOTALL)
+        text = re.sub(r"^(?:Here(?:'s| is) a thinking process:?|Thinking Process:?|Thought:?).*?(?=(?:```|\{|\[))", "", text, flags=re.DOTALL | re.IGNORECASE)
+        return text.strip()
+
+    @classmethod
+    def _extract_balanced_json_candidates(cls, text: str) -> list[str]:
+        import re
+        candidates = []
+        # 1. Fenced blocks
+        for m in re.finditer(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL):
+            cand = m.group(1).strip()
+            if (cand.startswith("{") and cand.endswith("}")) or (cand.startswith("[") and cand.endswith("]")):
+                candidates.append(cand)
+
+        # 2. Balanced braces { ... }
+        n = len(text)
+        for i in range(n):
+            if text[i] == "{":
+                start = i
+                depth = 0
+                in_str = False
+                escape = False
+                for j in range(i, n):
+                    ch = text[j]
+                    if in_str:
+                        if escape:
+                            escape = False
+                        elif ch == "\\":
+                            escape = True
+                        elif ch == '"':
+                            in_str = False
+                    else:
+                        if ch == '"':
+                            in_str = True
+                        elif ch == "{":
+                            depth += 1
+                        elif ch == "}":
+                            depth -= 1
+                            if depth == 0:
+                                candidates.append(text[start:j+1])
+                                break
+
+        # 3. Balanced brackets [ ... ]
+        for i in range(n):
+            if text[i] == "[":
+                start = i
+                depth = 0
+                in_str = False
+                escape = False
+                for j in range(i, n):
+                    ch = text[j]
+                    if in_str:
+                        if escape:
+                            escape = False
+                        elif ch == "\\":
+                            escape = True
+                        elif ch == '"':
+                            in_str = False
+                    else:
+                        if ch == '"':
+                            in_str = True
+                        elif ch == "[":
+                            depth += 1
+                        elif ch == "]":
+                            depth -= 1
+                            if depth == 0:
+                                candidates.append(text[start:j+1])
+                                break
+
+        return candidates
+
+    def _parse_json_response(self, raw: str) -> dict[str, Any] | list[Any]:
+        cleaned = self._clean_llm_text(raw)
         try:
-            start = raw.index("{")
-            end = raw.rindex("}") + 1
-            return json.loads(raw[start:end])
+            return json.loads(cleaned)
         except (ValueError, json.JSONDecodeError):
+            pass
+
+        candidates = self._extract_balanced_json_candidates(cleaned)
+        parsed_candidates = []
+        for cand in candidates:
+            try:
+                parsed_candidates.append(json.loads(cand))
+            except (ValueError, json.JSONDecodeError):
+                continue
+
+        if not parsed_candidates:
             return {}
+
+        expected_keys = (
+            "assignments", "coalitions", "dispatched", "action", "domain",
+            "merged_plan", "approved", "response_type", "plan_local",
+        )
+        for p in parsed_candidates:
+            if isinstance(p, dict) and any(k in p for k in expected_keys):
+                return p
+
+        for p in parsed_candidates:
+            if isinstance(p, (dict, list)) and p:
+                return p
+
+        return parsed_candidates[0] if parsed_candidates else {}
 
     def _observations_payload(
         self, scope: list[str] | None = None

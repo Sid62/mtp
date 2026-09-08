@@ -162,6 +162,12 @@ class DACAOrchestrator:
                 d_client.config["cache_responses"] = False
             self.continuity_engine = None
             self.delta_transfer_manager = None
+            self.cloud_llm.opt_constrained_output = False
+            self.cloud_llm.opt_prompt_compression = False
+            if getattr(self.cloud_llm, "summarizer", None):
+                self.cloud_llm.summarizer.enabled = False
+            if getattr(self.cloud_llm, "semantic_cache", None):
+                self.cloud_llm.semantic_cache.enabled = False
 
 
         from src.memory.experience_store import SubtaskExperienceStore
@@ -634,7 +640,9 @@ class DACAOrchestrator:
             targets = {s.subtask_id: s.target for s in self.env.subtask_list}
             if mode == 0:
                 # AutoHMA centralized execution: consume Device LLM ExecutionDirectives
-                agent_assignments = self.centralized.extract_executable_assignments(assignments)
+                agent_assignments = self.centralized.extract_executable_assignments(
+                    assignments, valid_subtask_ids=set(targets.keys())
+                )
             else:
                 agent_assignments = {}
                 for sid, agents in assignments.items():

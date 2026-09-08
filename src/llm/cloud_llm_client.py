@@ -668,21 +668,41 @@ class CloudLLMClient:
             return {}
         result = self._parse_assignments_response(raw, agents=agents, subtasks=subtasks)
         self.last_decompose_parsed = result
-        if not result and raw:
+        if not result and raw and raw.strip():
             _log(f"[PARSER WARNING] decompose(): failed to extract assignments from LLM response (len={len(raw)})")
-            if self._last_assignments:
-                _log("Falling back to previous valid decomposition plan")
-                result = self._last_assignments
-                self.last_decompose_parsed = result
-            elif self.device_fallback_decompose is not None:
-                try:
-                    _log("Falling back to device fallback for decomposition")
-                    fallback = self.device_fallback_decompose(instruction, agents, subtasks)
-                    if fallback:
-                        result = fallback
-                        self.last_decompose_parsed = result
-                except Exception as e:  # noqa: BLE001
-                    _log(f"Device fallback failed: {e}")
+            valid_aids = [str(a.get("id", a.get("agent_id"))) for a in agents if a.get("id") or a.get("agent_id")] if agents else []
+            valid_sids = [str(s.get("id", s.get("subtask_id"))) for s in subtasks if s.get("id") or s.get("subtask_id")] if subtasks else []
+            requery_prompt = (
+                "[CORRECTIVE RE-QUERY - PREVIOUS RESPONSE COULD NOT BE PARSED]\n"
+                "Your previous response did not contain a valid JSON assignments object.\n"
+                "Do NOT explain. Do NOT output any reasoning, thinking, or preamble.\n"
+                f"Valid agent IDs: {valid_aids}\n"
+                f"Valid subtask IDs: {valid_sids}\n"
+                'Return ONLY this JSON format:\n'
+                '{"assignments": {"T_0": ["agent_id"], ...}}'
+            )
+            raw_retry = self.complete(requery_prompt, system="You are a Cloud LLM task decomposer.", caller="decompose_retry")
+            if raw_retry != _FAILURE_SENTINEL:
+                result_retry = self._parse_assignments_response(raw_retry, agents=agents, subtasks=subtasks)
+                if result_retry:
+                    _log("[RECOVERED VIA RE-QUERY] Corrective re-query succeeded in extracting valid assignments.")
+                    result = result_retry
+                    self.last_decompose_parsed = result
+
+            if not result:
+                if self._last_assignments:
+                    _log("Falling back to previous valid decomposition plan")
+                    result = self._last_assignments
+                    self.last_decompose_parsed = result
+                elif self.experiment_architecture not in ("B1", "B2") and self.device_fallback_decompose is not None:
+                    try:
+                        _log("Falling back to device fallback for decomposition")
+                        fallback = self.device_fallback_decompose(instruction, agents, subtasks)
+                        if fallback:
+                            result = fallback
+                            self.last_decompose_parsed = result
+                    except Exception as e:  # noqa: BLE001
+                        _log(f"Device fallback failed: {e}")
         if result:
             self._last_assignments = result
             self.semantic_cache.put(
@@ -1034,46 +1054,109 @@ class CloudLLMClient:
     )
 
     def _clean_llm_text(self, raw: str) -> str:
-        """Strip reasoning wrappers like <think> or <thought> blocks."""
+        """Strip reasoning wrappers like <think> or conversational preambles."""
         import re
         text = re.sub(r"<(?:think|thought)>.*?</(?:think|thought)>", "", raw, flags=re.DOTALL)
+        text = re.sub(r"^(?:Here(?:'s| is) a thinking process:?|Thinking Process:?|Thought:?).*?(?=(?:```|\{|\[))", "", text, flags=re.DOTALL | re.IGNORECASE)
         return text.strip()
 
+    @classmethod
+    def _extract_balanced_json_candidates(cls, text: str) -> list[str]:
+        import re
+        candidates = []
+        # 1. Fenced blocks
+        for m in re.finditer(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL):
+            cand = m.group(1).strip()
+            if (cand.startswith("{") and cand.endswith("}")) or (cand.startswith("[") and cand.endswith("]")):
+                candidates.append(cand)
+
+        # 2. Balanced braces { ... }
+        n = len(text)
+        for i in range(n):
+            if text[i] == "{":
+                start = i
+                depth = 0
+                in_str = False
+                escape = False
+                for j in range(i, n):
+                    ch = text[j]
+                    if in_str:
+                        if escape:
+                            escape = False
+                        elif ch == "\\":
+                            escape = True
+                        elif ch == '"':
+                            in_str = False
+                    else:
+                        if ch == '"':
+                            in_str = True
+                        elif ch == "{":
+                            depth += 1
+                        elif ch == "}":
+                            depth -= 1
+                            if depth == 0:
+                                candidates.append(text[start:j+1])
+                                break
+
+        # 3. Balanced brackets [ ... ]
+        for i in range(n):
+            if text[i] == "[":
+                start = i
+                depth = 0
+                in_str = False
+                escape = False
+                for j in range(i, n):
+                    ch = text[j]
+                    if in_str:
+                        if escape:
+                            escape = False
+                        elif ch == "\\":
+                            escape = True
+                        elif ch == '"':
+                            in_str = False
+                    else:
+                        if ch == '"':
+                            in_str = True
+                        elif ch == "[":
+                            depth += 1
+                        elif ch == "]":
+                            depth -= 1
+                            if depth == 0:
+                                candidates.append(text[start:j+1])
+                                break
+
+        return candidates
+
     def _parse_relaxed_json(self, raw: str) -> Any:
-        """Robustly parse JSON from raw LLM output, handling markdown fences and wrappers."""
+        """Robustly parse JSON from raw LLM output, handling markdown fences, preambles, and balanced candidate objects."""
         cleaned = self._clean_llm_text(raw)
         try:
             return json.loads(cleaned)
         except (ValueError, json.JSONDecodeError):
             pass
 
-        import re
-        # Try markdown code blocks
-        matches = re.findall(r"```(?:json)?\s*(.*?)\s*```", cleaned, re.DOTALL)
-        for m in matches:
+        candidates = self._extract_balanced_json_candidates(cleaned)
+        parsed_candidates = []
+        for cand in candidates:
             try:
-                return json.loads(m.strip())
+                parsed_candidates.append(json.loads(cand))
             except (ValueError, json.JSONDecodeError):
-                pass
+                continue
 
-        # Try finding outermost object { ... }
-        try:
-            start_obj = cleaned.index("{")
-            end_obj = cleaned.rindex("}") + 1
-            return json.loads(cleaned[start_obj:end_obj])
-        except (ValueError, json.JSONDecodeError):
-            pass
+        if not parsed_candidates:
+            return {}
 
-        # Try finding outermost array [ ... ]
-        try:
-            start_arr = cleaned.index("[")
-            end_arr = cleaned.rindex("]") + 1
-            return json.loads(cleaned[start_arr:end_arr])
-        except (ValueError, json.JSONDecodeError):
-            pass
+        # Prefer candidates containing expected assignment wrapper keys
+        for p in parsed_candidates:
+            if isinstance(p, dict) and any(k in p for k in self._ASSIGNMENT_KEYS):
+                return p
 
-        # Fall back to repair parser
-        return self._parse_json(cleaned)
+        # Next prefer any non-empty dict or list
+        for p in parsed_candidates:
+            if isinstance(p, (dict, list)) and p:
+                return p
+
+        return parsed_candidates[0] if parsed_candidates else {}
 
     def _parse_assignments_response(
         self,
@@ -1115,17 +1198,22 @@ class CloudLLMClient:
 
         def normalize_task_id(tid: Any) -> str:
             s = str(tid).strip()
-            if valid_subtask_ids and s in valid_subtask_ids:
+            if not valid_subtask_ids:
                 return s
-            if s.isdigit() and valid_subtask_ids:
-                candidate = f"T_{s}"
-                if candidate in valid_subtask_ids:
-                    return candidate
+            if s in valid_subtask_ids:
+                return s
+            if s.isdigit() and f"T_{s}" in valid_subtask_ids:
+                return f"T_{s}"
             m = re.search(r"(\d+)", s)
-            if m and valid_subtask_ids:
-                candidate = f"T_{m.group(1)}"
+            if m:
+                num = m.group(1)
+                candidate = f"T_{num}"
                 if candidate in valid_subtask_ids:
                     return candidate
+                for v in valid_subtask_ids:
+                    vm = re.search(r"(\d+)", v)
+                    if vm and vm.group(1) == num:
+                        return v
             return s
 
         def extract_from_obj(data: Any) -> dict[str, list[str]]:

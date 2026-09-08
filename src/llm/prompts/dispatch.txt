@@ -8,4 +8,4 @@ Coalitions to dispatch:
 Execute dispatch: assign each coalition member their subtask waypoints and acknowledge receipt.
 
 Return ONLY valid JSON:
-{{"dispatched": true, "assignments": {{"agent_id": "subtask_id", ...}}, "ack": true}}
+{{"dispatched": true, "assignments": {{"agent_id": "T_0", ...}}, "ack": true}}
