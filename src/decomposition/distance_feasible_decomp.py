@@ -282,7 +282,11 @@ class DistanceFeasibleDecomposer:
         # contains a reachable agent. Skill priority is unchanged whenever the
         # preferred tier is reachable, so this is strictly a widening of the
         # fallback, not a change of preference.
-        tiers = (full_skill_candidates, any_skill_candidates, list(fleet.agents))
+        tiers = (
+            (full_skill_candidates, any_skill_candidates)
+            if subtask.required_skills
+            else (list(fleet.agents),)
+        )
         # Index of the tier the PREVIOUS implementation would have committed to:
         # full-skill if non-empty, else any-skill if non-empty, else whole fleet.
         legacy_idx = 0 if full_skill_candidates else (1 if any_skill_candidates else 2)
@@ -299,10 +303,13 @@ class DistanceFeasibleDecomposer:
                 return [chosen]
 
         # No agent of any tier is within r_reach. Assign the nearest agent from
-        # the most skilled non-empty tier so the subtask is never orphaned: it
-        # is a reachability problem (the agent can travel), not an assignment
-        # problem, and an orphaned subtask can never be completed at all.
-        tier = full_skill_candidates or any_skill_candidates or list(fleet.agents)
+        # the most skilled non-empty tier so the subtask is never orphaned.
+        # Hard constraint: Never assign an agent with zero matching skills.
+        tier = (
+            full_skill_candidates
+            or any_skill_candidates
+            or (list(fleet.agents) if not subtask.required_skills else [])
+        )
         if not tier:
             return []
         nearest = min(

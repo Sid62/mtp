@@ -177,8 +177,17 @@ def should_replan(
         if continuity_engine is not None and continuity_engine.can_continue_plan(
             fleet, subtasks, cqi_matrix, sys_cqi, packet_loss, latency
         ):
-            plan_state.known_completed_ids.update(newly_completed)
-            return False, ""
+            # Verify that the continuity engine actually produced at least one executable assignment for remaining tasks
+            active_incomplete = {s.subtask_id for s in remaining_tasks}
+            cont_assignments = getattr(continuity_engine.active_context, "assignments", {})
+            has_valid_exec = any(
+                agents and any(fleet.has_agent(a) for a in agents)
+                for sid, agents in cont_assignments.items()
+                if sid in active_incomplete
+            )
+            if has_valid_exec:
+                plan_state.known_completed_ids.update(newly_completed)
+                return False, ""
         return True, f"task_completed_needs_reassignment:{sorted(newly_completed)}"
 
     # --- Trigger 4: Coalition invalidated by agent unavailability ---------
@@ -261,18 +270,34 @@ def update_plan_state(
     over, so the next should_replan() call has a correct baseline to diff
     against. Called only immediately after a Cloud LLM call is accepted.
     """
-    exec_count = sum(
-        1 for sid, agent_list in assignments.items()
-        if agent_list and any(fleet.has_agent(a) for a in agent_list)
-    )
-    plan_state.executable_assignment_count = exec_count
+    incomplete_tasks = [s for s in subtasks if not s.completed]
+    from src.coordination.assignment_validator import AssignmentValidator
+    valid_exec_count = 0
+    assigned_agents: set[str] = set()
+    for sid, agent_list in assignments.items():
+        if not agent_list:
+            continue
+        for aid in agent_list:
+            valid, _ = AssignmentValidator.validate_single(
+                aid, sid, fleet, subtasks,
+                assigned_agents=assigned_agents,
+                check_skills=True,
+                strict_skills=False,
+                coalitions=coalitions,
+            )
+            if valid:
+                valid_exec_count += 1
+                assigned_agents.add(aid)
+                break
+
+    plan_state.executable_assignment_count = valid_exec_count
 
     # Invariant: A plan object that contains zero executable assignments
     # is NOT a valid initialized plan. Do not treat it as reusable.
-    if exec_count == 0 and len(subtasks) > 0:
+    if valid_exec_count == 0 and len(incomplete_tasks) > 0:
         plan_state.initialized = False
         plan_state.has_executable_plan = False
-        print(f"[PLAN-STATE] Step={current_step} Plan marked INVALID: 0 executable assignments")
+        print(f"[PLAN-STATE] Step={current_step} Plan marked INVALID: 0 valid executable assignments for {len(incomplete_tasks)} remaining tasks")
         return
 
     plan_state.initialized = True

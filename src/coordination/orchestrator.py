@@ -37,6 +37,12 @@ from src.coordination.autohma_structs import (
     DeviceFeedback,
     ExecutionFeedback,
 )
+from src.coordination.assignment_validator import (
+    AssignmentValidator,
+    validate_global_assignment_state,
+    log_assignment_transition,
+    log_assignment_removal,
+)
 
 
 
@@ -198,8 +204,10 @@ class DACAOrchestrator:
             continuity_engine=self.continuity_engine,
             experience_store=self.experience_store,
         )
+        from src.control.q_learning import QLearningCA
         self.ca_transfer = CATransferManager(
-            overlap_delta=self.thresholds.get("ca_overlap_delta", 3)
+            overlap_delta=self.thresholds.get("ca_overlap_delta", 3),
+            q_learning=QLearningCA(rng=np.random.default_rng(self.seed)),
         )
         self.reallocator = PostSwitchReallocator(
             device_llms=self.device_llms,
@@ -490,52 +498,85 @@ class DACAOrchestrator:
                                     best_d = d
                                     best_aid = aid
 
-                        # Pass 3 (last resort): nearest unassigned agent
-                        # Only used when NO skill-matching agent exists at all.
-                        if best_aid is None:
+                        # Pass 2b: partial skill-matching agents (at least one matching skill)
+                        if best_aid is None and required:
                             for aid in all_coalition_agents:
                                 if aid in assigned_agents:
                                     continue
                                 if not fleet.has_agent(aid):
+                                    continue
+                                skills = agent_skills.get(aid, set())
+                                if not (required & skills):
                                     continue
                                 agent = fleet.get_agent(aid)
                                 d = dist(agent.position, st.target)
                                 if d < best_d:
                                     best_d = d
                                     best_aid = aid
-                            if best_aid is not None:
-                                print(
-                                    f"[REALLOC-FALLBACK] {st.subtask_id}: no skill-match, "
-                                    f"using nearest agent {best_aid}"
-                                )
 
+                        # INVARIANT 7 & 8: No nearest-agent fallback without skill match.
+                        # If no valid agent exists, task remains explicitly UNRESOLVED.
                         if best_aid is not None:
                             new_assignments[st.subtask_id] = [best_aid]
                             assigned_agents.add(best_aid)
+                            log_assignment_transition(
+                                task_id=st.subtask_id,
+                                agent_id=best_aid,
+                                source="reallocation",
+                                previous_status="UNRESOLVED",
+                                new_status="VALID",
+                                mode=mode,
+                                step=step,
+                            )
                         elif st.subtask_id in assignments:
-                            # Preserve prior assignment if no coalition agent
-                            # is available (defensive fallback)
-                            new_assignments[st.subtask_id] = assignments[st.subtask_id]
+                            # Only preserve prior assignment if agent exists, matches skills, and is not assigned elsewhere
+                            prior_aids = [
+                                a for a in assignments[st.subtask_id]
+                                if fleet.has_agent(a)
+                                and (not required or bool(required & agent_skills.get(a, set())))
+                                and a not in assigned_agents
+                            ]
+                            if prior_aids:
+                                new_assignments[st.subtask_id] = [prior_aids[0]]
+                                assigned_agents.add(prior_aids[0])
+                            else:
+                                new_assignments[st.subtask_id] = []
+                        else:
+                            new_assignments[st.subtask_id] = []
 
-                    if new_assignments:
-                        assignments = new_assignments
-                        print(
-                            f"[REALLOC] Propagated validated assignments: "
-                            f"{list(assignments.keys())}"
-                        )
-                        # Update plan state so replanning logic sees the new state
-                        update_plan_state(
-                            self._plan_state,
-                            self.env.subtask_list,
-                            fleet,
-                            coalitions,
-                            assignments,
-                            mode=mode,
-                            sys_cqi=sys_cqi,
-                            packet_loss=avg_packet_loss,
-                            latency=avg_latency,
-                            current_step=step,
-                        )
+                    # Revalidate and clean reallocation assignments
+                    new_assignments, _ = AssignmentValidator.validate_and_clean_plan(
+                        new_assignments,
+                        fleet,
+                        self.env.subtask_list,
+                        coalitions=coalitions,
+                        source="reallocation",
+                        mode=mode,
+                        step=step,
+                    )
+                    assignments = new_assignments
+                    valid_keys = [k for k, v in assignments.items() if v]
+                    print(
+                        f"[REALLOC] Propagated validated assignments: {valid_keys}"
+                    )
+                    # Update plan state so replanning logic sees the new state
+                    update_plan_state(
+                        self._plan_state,
+                        self.env.subtask_list,
+                        fleet,
+                        coalitions,
+                        assignments,
+                        mode=mode,
+                        sys_cqi=sys_cqi,
+                        packet_loss=avg_packet_loss,
+                        latency=avg_latency,
+                        current_step=step,
+                    )
+                    validate_global_assignment_state(
+                        assignments, fleet, self.env.subtask_list,
+                        source="after_reallocation", mode=mode, step=step,
+                        coalitions=coalitions,
+                    )
                     t_realloc_end = time.perf_counter()
                     realloc_dur = t_realloc_end - t_realloc_start
                     coalition_computation_time_s += realloc_dur
@@ -631,6 +672,18 @@ class DACAOrchestrator:
                 )
             else:
                 print(f"[REPLAN] step={step} skipped -- reusing existing plan")
+                if self.continuity_engine is not None and self.continuity_engine.active_context is not None:
+                    # Sync updated assignments from continuity engine
+                    assignments = self.continuity_engine.get_updated_executable_assignments(fleet, self.env.subtask_list)
+                    assignments, _ = AssignmentValidator.validate_and_clean_plan(
+                        assignments,
+                        fleet,
+                        self.env.subtask_list,
+                        coalitions=coalitions,
+                        source="continuity_reuse",
+                        mode=mode,
+                        step=step,
+                    )
 
             print(f"\n[ASSIGN] Step={step}")
             for sid, agents in assignments.items():
@@ -671,7 +724,6 @@ class DACAOrchestrator:
 
             # Deterministic Assignment Validation
             t_val_start = time.perf_counter()
-            from src.coordination.assignment_validator import AssignmentValidator
             val_report = AssignmentValidator.filter_assignments(
                 agent_assignments,
                 self.env.fleet,
@@ -680,32 +732,116 @@ class DACAOrchestrator:
                 strict_skills=False,
                 coalitions=coalitions,
                 log_diagnostics=(step == 0 or step % 50 == 0),
+                source="execution",
+                mode=mode,
+                step=step,
             )
             validation_time_s += (time.perf_counter() - t_val_start)
             agent_assignments = val_report.valid_assignments
 
-            # Feasibility guard: If coordinator produces 0 executable assignments on active tasks,
-            # fail loudly rather than silently executing 200 empty steps.
+            # Phase 5: Clean master assignments after invalidation
+            if val_report.rejected_assignments:
+                for aid, sid in val_report.rejected_assignments.items():
+                    if sid in assignments and aid in assignments[sid]:
+                        assignments[sid].remove(aid)
+                    if sid in assignments and not assignments[sid]:
+                        assignments[sid] = []
+
+            # Phase 9: State-aware zero executable assignments recovery
             if len(agent_assignments) == 0 and len(remaining_tasks) > 0:
-                print(f"[FATAL] Zero executable assignments at step={step} for {len(remaining_tasks)} remaining tasks.")
-                from src.llm.exceptions import ExperimentFailed, FailureReport
-                report = FailureReport(
-                    experiment_status="INVALID_PLAN",
-                    failure_reason=f"Zero executable assignments at step {step}",
-                    scenario=self.scenario,
-                    architecture=self.config.name,
-                    network_profile=self.network_profile,
-                    seed=self.seed,
-                    simulation_step=step,
-                )
-                report.log()
-                report.persist()
-                raise ExperimentFailed(report)
+                if not replan_now:
+                    print(f"[RECOVERY] Zero executable assignments at step={step} while {len(remaining_tasks)} tasks remain. Triggering replan recovery.")
+                    self._plan_state.has_executable_plan = False
+                    self._plan_state.initialized = False
+                    t_rec_start = time.perf_counter()
+                    if mode == 0:
+                        assignments, coalitions, cloud_reasoned, dispatch_occurred = self.centralized.plan(
+                            self.env, cqi_matrix,
+                            device_feedbacks=device_feedbacks if device_feedbacks else None,
+                        )
+                        if cloud_reasoned:
+                            self.comm_counter.increment("global_planning", 1, "centralized_global_planning")
+                            device_feedbacks.clear()
+                        if dispatch_occurred:
+                            self.comm_counter.increment("dispatch", 1, "centralized_domain_dispatch")
+                    else:
+                        assignments, coalitions, cloud_reasoned = self.decentralized.plan(self.env, cqi_matrix)
+                        if cloud_reasoned:
+                            self.comm_counter.increment("local_coordination", 1, "decentralized_leader_planning")
+                            self.comm_counter.increment("peer_consensus", 1, "decentralized_peer_review_consensus")
+                            self.comm_counter.increment("feedback_sync", 1, "decentralized_state_sync")
+                    plan_lat = time.perf_counter() - t_rec_start
+                    planning_time_s += plan_lat
+                    self._planning_latency_total += plan_lat
+                    self._planning_latency_count += 1
+                    self._replanning_count += 1
+                    update_plan_state(
+                        self._plan_state,
+                        self.env.subtask_list,
+                        fleet,
+                        coalitions,
+                        assignments,
+                        mode=mode,
+                        sys_cqi=sys_cqi,
+                        packet_loss=avg_packet_loss,
+                        latency=avg_latency,
+                        current_step=step,
+                    )
+                    # Re-extract and re-validate
+                    if mode == 0:
+                        agent_assignments = self.centralized.extract_executable_assignments(
+                            assignments,
+                            valid_subtask_ids=active_sids,
+                            fleet_agent_ids={a.agent_id for a in self.env.fleet.agents},
+                        )
+                    else:
+                        agent_assignments = {}
+                        for sid, agents in assignments.items():
+                            if sid in active_sids and agents:
+                                agent_assignments[agents[0]] = sid
+                    val_report = AssignmentValidator.filter_assignments(
+                        agent_assignments,
+                        self.env.fleet,
+                        self.env.subtask_list,
+                        check_skills=True,
+                        strict_skills=False,
+                        coalitions=coalitions,
+                        log_diagnostics=True,
+                        source="recovery",
+                        mode=mode,
+                        step=step,
+                    )
+                    agent_assignments = val_report.valid_assignments
+
+                # Feasibility guard: If coordinator produces 0 executable assignments after recovery, fail explicitly.
+                if len(agent_assignments) == 0 and len(remaining_tasks) > 0:
+                    print(f"[FATAL] Zero executable assignments at step={step} for {len(remaining_tasks)} remaining tasks.")
+                    from src.llm.exceptions import ExperimentFailed, FailureReport
+                    report = FailureReport(
+                        experiment_status="UNSATISFIABLE_ASSIGNMENT",
+                        failure_reason=f"Zero executable assignments at step {step} for remaining tasks",
+                        scenario=self.scenario,
+                        architecture=self.config.name,
+                        network_profile=self.network_profile,
+                        seed=self.seed,
+                        simulation_step=step,
+                    )
+                    report.log()
+                    report.persist()
+                    raise ExperimentFailed(report)
+
+            # Phase 11: Validate global state before execution
+            validate_global_assignment_state(
+                agent_assignments, fleet, self.env.subtask_list,
+                source="pre_execution", mode=mode, step=step,
+                coalitions=coalitions,
+            )
 
             t_sim_body = time.perf_counter()
             self.ca_transfer.step(self.env.fleet, mode, agent_assignments, targets)
 
-            for sid, agent_list in assignments.items():
+            for sid in list(assignments.keys()):
+                agent_list = assignments.get(sid, [])
                 if not agent_list:
                     continue
                 if not fleet.has_agent(agent_list[0]):
@@ -725,19 +861,57 @@ class DACAOrchestrator:
                     from src.coordination.constants import COMPLETION_RADIUS_M
                     if not subtask.completed and dist(agent.position, subtask.target) < COMPLETION_RADIUS_M:
                         transitioned = self.env.mark_subtask_complete(sid)
-                        if transitioned and hasattr(self, "experience_store") and self.experience_store is not None and self.experience_store.enabled:
-                            from src.memory.experience_store import compute_signature
-                            agent_types = [a.agent_type.value for a in fleet.agents]
-                            d_lead = dist(agent.position, subtask.target)
-                            sig = compute_signature(self.scenario, subtask.required_skills, agent_types, d_lead)
-                            self.experience_store.record(
-                                signature=sig,
-                                plan={sid: assignments.get(sid, [agent.agent_id])},
-                                success=True,
-                                scenario=self.scenario,
-                                skills=subtask.required_skills,
-                                agent_types=agent_types,
+                        if transitioned:
+                            # Invariants 3, 9, 11: Atomically purge completed task from all active structures
+                            assignments.pop(sid, None)
+                            if self.continuity_engine and self.continuity_engine.active_context:
+                                self.continuity_engine.active_context.completed_subtask_ids.add(sid)
+                                self.continuity_engine.active_context.assignments.pop(sid, None)
+                            if hasattr(self, "centralized") and self.centralized:
+                                self.centralized._last_dispatched_assignments.pop(sid, None)
+                            if hasattr(self, "decentralized") and self.decentralized:
+                                for sp in self.decentralized.shared_plans.values():
+                                    sp.subtasks = [
+                                        t for t in sp.subtasks
+                                        if (t.subtask_id if hasattr(t, "subtask_id") else t) != sid
+                                    ]
+                                    sp.agent_assignments = {a: t for a, t in sp.agent_assignments.items() if t != sid}
+                            self._plan_state.known_completed_ids.add(sid)
+                            if sid in agent.assigned_subtasks:
+                                agent.assigned_subtasks.remove(sid)
+                            if sid not in agent.completed_subtasks:
+                                agent.completed_subtasks.append(sid)
+
+                            log_assignment_transition(
+                                task_id=sid,
+                                agent_id=agent.agent_id,
+                                source="completion",
+                                previous_status="ACTIVE",
+                                new_status="COMPLETED",
+                                mode=mode,
+                                step=step,
                             )
+                            log_assignment_removal(
+                                task_id=sid,
+                                agent_id=agent.agent_id,
+                                mode=mode,
+                                step=step,
+                                reason="task_completed",
+                            )
+
+                            if hasattr(self, "experience_store") and self.experience_store is not None and self.experience_store.enabled:
+                                from src.memory.experience_store import compute_signature
+                                agent_types = [a.agent_type.value for a in fleet.agents]
+                                d_lead = dist(agent.position, subtask.target)
+                                sig = compute_signature(self.scenario, subtask.required_skills, agent_types, d_lead)
+                                self.experience_store.record(
+                                    signature=sig,
+                                    plan={sid: [agent.agent_id]},
+                                    success=True,
+                                    scenario=self.scenario,
+                                    skills=subtask.required_skills,
+                                    agent_types=agent_types,
+                                )
 
             self.env.advance()
             step_dur = time.perf_counter() - t_sim_body

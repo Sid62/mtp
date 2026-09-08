@@ -440,7 +440,13 @@ class DecentralizedHybridCoordinator:
                 reason = reason or "coalition_broken"
 
             if reason and reason != "poor_cloud_comm":
-                candidates = [a for a in domain_map.get(domain, []) if a in live_agent_ids]
+                st = next((s for s in env.subtask_list if s.subtask_id == sid), None)
+                req_skills = set(st.required_skills) if st and st.required_skills else set()
+                candidates = [
+                    a for a in domain_map.get(domain, [])
+                    if a in live_agent_ids
+                    and (not req_skills or bool(req_skills & set(fleet.get_agent(a).skills)))
+                ]
                 if not candidates:
                     continue
                 new_agent = min(

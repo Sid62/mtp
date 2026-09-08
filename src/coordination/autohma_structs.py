@@ -12,7 +12,39 @@ They introduce no new computation, no new API calls, and no behavioral change.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
+
+
+class AssignmentStatus(str, Enum):
+    """Canonical lifecycle status of a task-agent assignment."""
+    CANDIDATE = "CANDIDATE"
+    VALID = "VALID"
+    INVALID = "INVALID"
+    UNRESOLVED = "UNRESOLVED"
+    ACTIVE = "ACTIVE"
+    COMPLETED = "COMPLETED"
+
+
+@dataclass
+class AssignmentRecord:
+    """Canonical representation of an assignment."""
+    task_id: str
+    agent_id: str
+    source: str = "unknown"  # "cloud", "device", "reallocation", "consensus", "continuity", "local_reassign"
+    status: AssignmentStatus = AssignmentStatus.CANDIDATE
+    reason: str = ""
+    step: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "agent_id": self.agent_id,
+            "source": self.source,
+            "status": self.status.value if isinstance(self.status, AssignmentStatus) else str(self.status),
+            "reason": self.reason,
+            "step": self.step,
+        }
 
 
 @dataclass
@@ -266,3 +298,87 @@ def format_feedback_for_cloud(
         if line:
             lines.append(line)
     return "\n".join(lines)
+
+
+def normalize_to_assignment_records(
+    raw: dict[str, Any],
+    source: str = "unknown",
+    step: int = 0,
+    valid_subtask_ids: set[str] | None = None,
+) -> list[AssignmentRecord]:
+    """Convert raw assignments (task->agents or agent->task) into canonical AssignmentRecords."""
+    records: list[AssignmentRecord] = []
+    if not isinstance(raw, dict):
+        return records
+
+    for k, v in raw.items():
+        k_str = str(k).strip()
+        if k_str.lower() in RESERVED_SCHEMA_KEYS:
+            continue
+        if isinstance(v, (list, set, tuple)):
+            for item in v:
+                aid = str(item).strip()
+                if aid and aid.lower() not in RESERVED_SCHEMA_KEYS:
+                    sid = normalize_subtask_id(k_str, valid_subtask_ids)
+                    records.append(
+                        AssignmentRecord(
+                            task_id=sid,
+                            agent_id=aid,
+                            source=source,
+                            status=AssignmentStatus.CANDIDATE,
+                            step=step,
+                        )
+                    )
+        elif isinstance(v, str):
+            v_str = v.strip()
+            if v_str.lower() in RESERVED_SCHEMA_KEYS:
+                continue
+            # Determine which is task and which is agent
+            if k_str.startswith(("uav", "robot", "vehicle")):
+                sid = normalize_subtask_id(v_str, valid_subtask_ids)
+                records.append(
+                    AssignmentRecord(
+                        task_id=sid,
+                        agent_id=k_str,
+                        source=source,
+                        status=AssignmentStatus.CANDIDATE,
+                        step=step,
+                    )
+                )
+            else:
+                sid = normalize_subtask_id(k_str, valid_subtask_ids)
+                records.append(
+                    AssignmentRecord(
+                        task_id=sid,
+                        agent_id=v_str,
+                        source=source,
+                        status=AssignmentStatus.CANDIDATE,
+                        step=step,
+                    )
+                )
+    return records
+
+
+def records_to_task_assignments(
+    records: list[AssignmentRecord],
+    allowed_statuses: set[AssignmentStatus] | None = None,
+) -> dict[str, list[str]]:
+    """Convert records to task_id -> list[agent_id] dict."""
+    res: dict[str, list[str]] = {}
+    for r in records:
+        if allowed_statuses is None or r.status in allowed_statuses:
+            res.setdefault(r.task_id, []).append(r.agent_id)
+    return res
+
+
+def records_to_agent_assignments(
+    records: list[AssignmentRecord],
+    allowed_statuses: set[AssignmentStatus] | None = None,
+) -> dict[str, str]:
+    """Convert records to agent_id -> task_id dict (for execution)."""
+    res: dict[str, str] = {}
+    for r in records:
+        if allowed_statuses is None or r.status in allowed_statuses:
+            res[r.agent_id] = r.task_id
+    return res
+

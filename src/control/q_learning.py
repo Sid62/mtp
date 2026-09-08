@@ -18,6 +18,7 @@ class QLearningCA:
     q_table: dict[tuple, np.ndarray] = field(default_factory=dict)
     _standby: bool = True
     n_actions: int = 8
+    rng: np.random.Generator = field(default_factory=lambda: np.random.default_rng(0))
 
     def _discretize_state(self, fleet: AgentFleet, agent_id: str) -> tuple:
         agent = fleet.get_agent(agent_id)
@@ -35,8 +36,8 @@ class QLearningCA:
     def select_action(self, state: tuple) -> int:
         if state not in self.q_table:
             self.q_table[state] = np.zeros(self.n_actions)
-        if np.random.random() < self.epsilon:
-            return int(np.random.randint(self.n_actions))
+        if self.rng.random() < self.epsilon:
+            return int(self.rng.integers(0, self.n_actions))
         return int(np.argmax(self.q_table[state]))
 
     def update(

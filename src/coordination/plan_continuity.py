@@ -216,7 +216,11 @@ class PlanContinuityEngine:
                 aid = prev_agents[0]
                 if aid in agent_map:
                     agent = agent_map[aid]
-                    if dist(agent.position, st.target) < lock_threshold:
+                    has_skills = (
+                        not st.required_skills
+                        or bool(set(st.required_skills) & set(agent.skills))
+                    )
+                    if has_skills and dist(agent.position, st.target) < lock_threshold:
                         # Lock agent to this subtask
                         locked_assignments[sid] = [aid]
                         locked_agent_ids.add(aid)
@@ -254,7 +258,12 @@ class PlanContinuityEngine:
         agent_map = {a.agent_id: a for a in fleet.agents}
         for s in incomplete_subtasks:
             sid = s.subtask_id
-            curr_agents = [aid for aid in ctx.assignments.get(sid, []) if aid in agent_map]
+            curr_agents = [
+                aid for aid in ctx.assignments.get(sid, [])
+                if aid in agent_map and (
+                    not s.required_skills or (set(s.required_skills) & set(agent_map[aid].skills))
+                )
+            ]
             if curr_agents:
                 updated_assignments[sid] = curr_agents
                 assigned_agents.update(curr_agents)
@@ -271,12 +280,17 @@ class PlanContinuityEngine:
                 if not agents:
                     st = next((s for s in incomplete_subtasks if s.subtask_id == sid), None)
                     if st:
+                        # Full skill match preferred
                         eligible = [
                             aid for aid in freed_agents
                             if set(st.required_skills).issubset(set(agent_map[aid].skills)) or not st.required_skills
                         ]
-                        if not eligible:
-                            eligible = list(freed_agents)
+                        # Partial matching skills fallback (never zero matching skills)
+                        if not eligible and st.required_skills:
+                            eligible = [
+                                aid for aid in freed_agents
+                                if set(st.required_skills) & set(agent_map[aid].skills)
+                            ]
                         if eligible:
                             best_agent = min(
                                 eligible, key=lambda aid: dist(agent_map[aid].position, st.target)
