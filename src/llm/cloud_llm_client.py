@@ -307,7 +307,7 @@ class CloudLLMClient:
 
         if self.config.get("use_mock", True):
             before = self.usage.cloud_api_calls
-            response = self._mock_response(prompt)
+            response = self._mock_response(prompt, caller=caller)
             p_tok = len(prompt.split())
             c_tok = len(response.split())
             t_tok = p_tok + c_tok
@@ -482,12 +482,17 @@ class CloudLLMClient:
     # ------------------------------------------------------------------
     # Mock helpers — used ONLY for explicit use_mock=true baseline runs
     # ------------------------------------------------------------------
-    def _mock_response(self, prompt: str) -> str:
+    def _mock_response(self, prompt: str, caller: str = "") -> str:
+        c_low = caller.lower()
         pl = prompt.lower()
+        if "decompose" in c_low or "decomposition" in pl or "task decomposer" in pl:
+            return self._mock_decomposition(prompt)
+        if "coalition" in c_low or "form_coalition" in pl or "coalition planner" in pl:
+            return self._mock_coalition(prompt)
+        if "assign" in pl or "subtask" in pl:
+            return self._mock_decomposition(prompt)
         if "coalition" in pl:
             return self._mock_coalition(prompt)
-        if "decompose" in pl or "task decomposer" in pl or "assign" in pl or "subtask" in pl:
-            return self._mock_decomposition(prompt)
         return json.dumps({"status": "ok"})
 
     def _agent_id(self, agent: dict) -> str:
@@ -560,6 +565,19 @@ class CloudLLMClient:
             subtasks = self._extract_labeled_json(prompt, "Subtasks")
         if agents is not None and subtasks is not None:
             return json.dumps({"assignments": self._mock_assignments_from_inputs(agents, subtasks)})
+        import re
+        m_aids = re.search(r"Valid agent IDs:\s*(\[[^\]]*\])", prompt)
+        m_sids = re.search(r"Valid subtask IDs:\s*(\[[^\]]*\])", prompt)
+        if m_aids and m_sids:
+            try:
+                import ast
+                aids = ast.literal_eval(m_aids.group(1))
+                sids = ast.literal_eval(m_sids.group(1))
+                if aids and sids:
+                    assigns = {str(sid): [str(aids[i % len(aids)])] for i, sid in enumerate(sids)}
+                    return json.dumps({"assignments": assigns})
+            except Exception:
+                pass
         try:
             start = prompt.index("{")
             ctx = json.loads(
@@ -567,9 +585,11 @@ class CloudLLMClient:
             )
             subtasks = ctx.get("subtasks", [])
             agents = ctx.get("agents", [])
-            return json.dumps({"assignments": self._mock_assignments_from_inputs(agents, subtasks)})
+            if subtasks and agents:
+                return json.dumps({"assignments": self._mock_assignments_from_inputs(agents, subtasks)})
         except (ValueError, json.JSONDecodeError):
-            return json.dumps({"assignments": {}})
+            pass
+        return json.dumps({"assignments": {}})
 
     def _mock_coalition(self, prompt: str) -> str:
         agents = self._extract_labeled_json(prompt, "Agents (with positions and skills)")
