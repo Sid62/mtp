@@ -7,11 +7,12 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from src.llm.exceptions import ExperimentFailed
-
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.llm.exceptions import ExperimentFailed
 
 from src.coordination.orchestrator import CONFIGS, DACAOrchestrator
 from src.metrics.evaluation import MetricsCollector
