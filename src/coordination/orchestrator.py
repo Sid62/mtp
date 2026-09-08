@@ -641,6 +641,25 @@ class DACAOrchestrator:
                     if agents:
                         agent_assignments[agents[0]] = sid
 
+            # Feasibility guard: If coordinator produces 0 executable assignments on active tasks,
+            # fail loudly rather than silently executing 200 empty steps.
+            remaining_tasks = [s for s in self.env.subtask_list if not s.completed]
+            if len(agent_assignments) == 0 and len(remaining_tasks) > 0:
+                print(f"[FATAL] Zero executable assignments at step={step} for {len(remaining_tasks)} remaining tasks.")
+                from src.llm.exceptions import ExperimentFailed, FailureReport
+                report = FailureReport(
+                    experiment_status="FAILED",
+                    failure_reason=f"Zero executable assignments at step {step}",
+                    scenario=self.scenario,
+                    architecture=self.config.name,
+                    network_profile=self.network_profile,
+                    seed=self.seed,
+                    simulation_step=step,
+                )
+                report.log()
+                report.persist()
+                raise ExperimentFailed(report)
+
             t_sim_body = time.perf_counter()
             self.ca_transfer.step(self.env.fleet, mode, agent_assignments, targets)
 

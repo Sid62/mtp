@@ -647,22 +647,42 @@ class CloudLLMClient:
             prompt = prompt + "\n" + execution_feedback_context
 
         raw = self.complete(prompt, system="You are a Cloud LLM task decomposer.", caller="decompose")
+        self.last_decompose_raw = raw
         if raw == _FAILURE_SENTINEL:
             _log("decompose() degraded: cloud LLM unavailable")
             if self._last_assignments:
                 _log("Falling back to previous valid decomposition plan")
+                self.last_decompose_parsed = self._last_assignments
                 return self._last_assignments
             if self.device_fallback_decompose is not None:
                 try:
                     _log("Falling back to local Device LLM for decomposition")
                     fallback = self.device_fallback_decompose(instruction, agents, subtasks)
                     if fallback:
+                        self.last_decompose_parsed = fallback
                         return fallback
                 except Exception as e:  # noqa: BLE001
                     _log(f"Device LLM fallback failed: {e}")
             _log("No fallback available -- returning empty assignment, simulation continues")
+            self.last_decompose_parsed = {}
             return {}
-        result = self._parse_assignments_response(raw)
+        result = self._parse_assignments_response(raw, agents=agents, subtasks=subtasks)
+        self.last_decompose_parsed = result
+        if not result and raw:
+            _log(f"[PARSER WARNING] decompose(): failed to extract assignments from LLM response (len={len(raw)})")
+            if self._last_assignments:
+                _log("Falling back to previous valid decomposition plan")
+                result = self._last_assignments
+                self.last_decompose_parsed = result
+            elif self.device_fallback_decompose is not None:
+                try:
+                    _log("Falling back to device fallback for decomposition")
+                    fallback = self.device_fallback_decompose(instruction, agents, subtasks)
+                    if fallback:
+                        result = fallback
+                        self.last_decompose_parsed = result
+                except Exception as e:  # noqa: BLE001
+                    _log(f"Device fallback failed: {e}")
         if result:
             self._last_assignments = result
             self.semantic_cache.put(
@@ -730,10 +750,12 @@ class CloudLLMClient:
             prompt = prompt + "\n" + execution_feedback_context
 
         raw = self.complete(prompt, system="You are a Cloud LLM coalition planner.", caller="form_coalitions")
+        self.last_coalitions_raw = raw
         if raw == _FAILURE_SENTINEL:
             _log("form_coalitions() degraded: cloud LLM unavailable")
             if self._last_coalitions:
                 _log("Falling back to previous valid coalitions")
+                self.last_coalitions_parsed = self._last_coalitions
                 return self._last_coalitions
             if self.device_fallback_coalitions is not None:
                 try:
@@ -742,10 +764,12 @@ class CloudLLMClient:
                         subtasks, agents, distance_matrix, cqi_matrix
                     )
                     if fallback:
+                        self.last_coalitions_parsed = fallback
                         return fallback
                 except Exception as e:  # noqa: BLE001
                     _log(f"Device LLM fallback failed: {e}")
             _log("No fallback available -- returning empty coalitions, simulation continues")
+            self.last_coalitions_parsed = []
             return []
 
         # Dedicated raw log output for Task 4
@@ -767,6 +791,7 @@ class CloudLLMClient:
         }
 
         result, fallback_used, stripped_map = self._parse_coalitions_response(raw, agents)
+        self.last_coalitions_parsed = result
         if fallback_used:
             self.hallucination_stats["form_coalitions_failure_count"] = self.hallucination_stats.get("form_coalitions_failure_count", 0) + 1
             tot = self.hallucination_stats.get("form_coalitions_success_count", 0) + self.hallucination_stats["form_coalitions_failure_count"]
@@ -1003,20 +1028,214 @@ class CloudLLMClient:
                 coalitions.append({"coalition_id": i, "members": [aid]})
         return coalitions
 
-    def _parse_assignments_response(self, raw: str) -> dict[str, list[str]]:
-        """Robustly extract assignments from a real LLM response."""
-        parsed = self._parse_json(raw)
-        for key in self._ASSIGNMENT_KEYS:
-            val = parsed.get(key)
-            if isinstance(val, dict) and val:
-                return self._normalize_assignments(val)
-        # Any remaining dict-valued key whose values look like agent lists
-        for val in parsed.values():
-            if isinstance(val, dict) and val:
-                first_v = next(iter(val.values()), None)
-                if isinstance(first_v, (list, str)):
-                    return self._normalize_assignments(val)
-        return {}
+    _ASSIGNMENT_KEYS = (
+        "assignments", "task_assignments", "decomposition", "allocation",
+        "tasks", "subtasks", "plan", "dispatch", "agent_assignments"
+    )
+
+    def _clean_llm_text(self, raw: str) -> str:
+        """Strip reasoning wrappers like <think> or <thought> blocks."""
+        import re
+        text = re.sub(r"<(?:think|thought)>.*?</(?:think|thought)>", "", raw, flags=re.DOTALL)
+        return text.strip()
+
+    def _parse_relaxed_json(self, raw: str) -> Any:
+        """Robustly parse JSON from raw LLM output, handling markdown fences and wrappers."""
+        cleaned = self._clean_llm_text(raw)
+        try:
+            return json.loads(cleaned)
+        except (ValueError, json.JSONDecodeError):
+            pass
+
+        import re
+        # Try markdown code blocks
+        matches = re.findall(r"```(?:json)?\s*(.*?)\s*```", cleaned, re.DOTALL)
+        for m in matches:
+            try:
+                return json.loads(m.strip())
+            except (ValueError, json.JSONDecodeError):
+                pass
+
+        # Try finding outermost object { ... }
+        try:
+            start_obj = cleaned.index("{")
+            end_obj = cleaned.rindex("}") + 1
+            return json.loads(cleaned[start_obj:end_obj])
+        except (ValueError, json.JSONDecodeError):
+            pass
+
+        # Try finding outermost array [ ... ]
+        try:
+            start_arr = cleaned.index("[")
+            end_arr = cleaned.rindex("]") + 1
+            return json.loads(cleaned[start_arr:end_arr])
+        except (ValueError, json.JSONDecodeError):
+            pass
+
+        # Fall back to repair parser
+        return self._parse_json(cleaned)
+
+    def _parse_assignments_response(
+        self,
+        raw: str,
+        agents: list[dict] | None = None,
+        subtasks: list[dict] | None = None,
+    ) -> dict[str, list[str]]:
+        """Robustly extract assignments from a real LLM response across diverse schemas."""
+        import re
+
+        valid_agent_ids = {
+            str(a.get("id", a.get("agent_id")))
+            for a in agents
+            if a.get("id") or a.get("agent_id")
+        } if agents else None
+
+        valid_subtask_ids = {
+            str(s.get("id", s.get("subtask_id")))
+            for s in subtasks
+            if s.get("id") or s.get("subtask_id")
+        } if subtasks else None
+
+        def is_agent(s: str) -> bool:
+            if valid_agent_ids:
+                return s in valid_agent_ids
+            return any(s.startswith(prefix) for prefix in ("uav", "vehicle", "robot", "agent", "ugv"))
+
+        def is_subtask(s: str) -> bool:
+            if valid_subtask_ids:
+                if s in valid_subtask_ids:
+                    return True
+                if s.isdigit() and f"T_{s}" in valid_subtask_ids:
+                    return True
+                m = re.search(r"(\d+)", s)
+                if m and f"T_{m.group(1)}" in valid_subtask_ids:
+                    return True
+                return False
+            return bool(re.match(r"^(?:T_?\d+|task_?\d+|subtask_?\d+|\d+)$", s, re.IGNORECASE))
+
+        def normalize_task_id(tid: Any) -> str:
+            s = str(tid).strip()
+            if valid_subtask_ids and s in valid_subtask_ids:
+                return s
+            if s.isdigit() and valid_subtask_ids:
+                candidate = f"T_{s}"
+                if candidate in valid_subtask_ids:
+                    return candidate
+            m = re.search(r"(\d+)", s)
+            if m and valid_subtask_ids:
+                candidate = f"T_{m.group(1)}"
+                if candidate in valid_subtask_ids:
+                    return candidate
+            return s
+
+        def extract_from_obj(data: Any) -> dict[str, list[str]]:
+            if not data:
+                return {}
+
+            if isinstance(data, dict):
+                # 1. Check known assignment wrapper keys
+                for k in self._ASSIGNMENT_KEYS:
+                    if k in data:
+                        res = extract_from_obj(data[k])
+                        if res:
+                            return res
+
+                # 2. Check if dict itself is a direct or inverted map
+                agent_keys = sum(1 for k in data if is_agent(str(k).strip()))
+                task_keys = sum(1 for k in data if is_subtask(str(k).strip()))
+
+                if agent_keys > task_keys and agent_keys > 0:
+                    # Inverted: agent_id -> subtask_id
+                    res: dict[str, list[str]] = {}
+                    for aid, tid in data.items():
+                        aid_str = str(aid).strip()
+                        if isinstance(tid, (list, tuple)):
+                            for t in tid:
+                                res.setdefault(normalize_task_id(t), []).append(aid_str)
+                        else:
+                            res.setdefault(normalize_task_id(tid), []).append(aid_str)
+                    return res
+                elif task_keys > 0:
+                    # Direct: subtask_id -> agent_id(s)
+                    res = {}
+                    for tid, aids in data.items():
+                        tid_str = normalize_task_id(tid)
+                        if isinstance(aids, str):
+                            res[tid_str] = [aids]
+                        elif isinstance(aids, (list, tuple)):
+                            res[tid_str] = [str(a) for a in aids]
+                        elif isinstance(aids, dict):
+                            extracted = aids.get("members", aids.get("agents", aids.get("agent_id", aids.get("agent", []))))
+                            if isinstance(extracted, str):
+                                res[tid_str] = [extracted]
+                            elif isinstance(extracted, list):
+                                res[tid_str] = [str(x) for x in extracted]
+                    if res:
+                        return res
+
+                # 3. Search nested dict values
+                for val in data.values():
+                    if isinstance(val, (dict, list)):
+                        res = extract_from_obj(val)
+                        if res:
+                            return res
+
+            elif isinstance(data, list):
+                res = {}
+                for item in data:
+                    if isinstance(item, dict):
+                        tid = None
+                        for tid_key in ("subtask_id", "subtask", "task_id", "task", "id", "subtaskId", "taskId"):
+                            if tid_key in item:
+                                tid = item[tid_key]
+                                break
+                        aids = None
+                        for aid_key in ("assigned_agents", "agents", "agent_ids", "members", "agent_id", "agent", "assigned_to"):
+                            if aid_key in item:
+                                aids = item[aid_key]
+                                break
+                        if tid is not None and aids is not None:
+                            tid_norm = normalize_task_id(tid)
+                            if isinstance(aids, str):
+                                res.setdefault(tid_norm, []).append(aids)
+                            elif isinstance(aids, (list, tuple)):
+                                res.setdefault(tid_norm, []).extend([str(a) for a in aids])
+                    elif isinstance(item, (list, tuple)) and len(item) == 2:
+                        e1, e2 = str(item[0]).strip(), str(item[1]).strip()
+                        if is_subtask(e1) and is_agent(e2):
+                            res.setdefault(normalize_task_id(e1), []).append(e2)
+                        elif is_agent(e1) and is_subtask(e2):
+                            res.setdefault(normalize_task_id(e2), []).append(e1)
+                        else:
+                            res.setdefault(normalize_task_id(e1), []).append(e2)
+                if res:
+                    return res
+
+            return {}
+
+        parsed = self._parse_relaxed_json(raw)
+        raw_result = extract_from_obj(parsed)
+
+        # Validation & clean-up
+        clean_result: dict[str, list[str]] = {}
+        for sid, agents_list in raw_result.items():
+            if valid_subtask_ids and sid not in valid_subtask_ids:
+                continue
+            clean_agents = []
+            for a in agents_list:
+                a_str = str(a).strip()
+                if valid_agent_ids and a_str not in valid_agent_ids:
+                    _log(f"[PARSER WARNING] Stripped invalid agent ID '{a_str}' from subtask {sid}")
+                    continue
+                if a_str not in clean_agents:
+                    clean_agents.append(a_str)
+            if clean_agents:
+                clean_result[sid] = clean_agents
+
+        if not clean_result and raw and raw.strip():
+            _log(f"[PARSER ERROR] _parse_assignments_response: could not extract valid assignments from LLM response (len={len(raw)}): {raw[:300]}")
+
+        return clean_result
 
     @staticmethod
     def _normalize_assignments(raw_map: dict) -> dict[str, list[str]]:

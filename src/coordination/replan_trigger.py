@@ -34,6 +34,8 @@ class PlanState:
     """
 
     initialized: bool = False
+    has_executable_plan: bool = False
+    executable_assignment_count: int = 0
     known_subtask_ids: set[str] = field(default_factory=set)
     known_completed_ids: set[str] = field(default_factory=set)
     known_agent_ids: set[str] = field(default_factory=set)
@@ -74,12 +76,11 @@ def should_replan(
     Cloud LLM this step.
     """
 
-    # --- Trigger 1: Mission initialization --------------------------------
-    # No plan exists yet, so there is nothing to reuse. This is the only
-    # unconditional call: an initial decomposition/coalition assignment is
-    # a prerequisite for any execution at all, not an optimization choice.
-    if not plan_state.initialized:
-        return True, "mission_initialization"
+    # --- Trigger 1: Mission initialization / empty plan -------------------
+    # No plan exists yet, or the stored plan contains 0 executable assignments,
+    # so there is nothing to execute. Mark plan invalid and trigger planning.
+    if not plan_state.initialized or not getattr(plan_state, "has_executable_plan", True):
+        return True, "mission_initialization" if not plan_state.initialized else "empty_or_invalid_plan"
      # --- Trigger 1b: Architecture switch -----------------------------------
     # Evaluate Plan Continuity on architecture switch (Centralized <-> Decentralized).
     # If the active plan is still valid (V_plan >= threshold), preserve and continue execution!
@@ -250,7 +251,22 @@ def update_plan_state(
     over, so the next should_replan() call has a correct baseline to diff
     against. Called only immediately after a Cloud LLM call is accepted.
     """
+    exec_count = sum(
+        1 for sid, agent_list in assignments.items()
+        if agent_list and any(fleet.has_agent(a) for a in agent_list)
+    )
+    plan_state.executable_assignment_count = exec_count
+
+    # Invariant: A plan object that contains zero executable assignments
+    # is NOT a valid initialized plan. Do not treat it as reusable.
+    if exec_count == 0 and len(subtasks) > 0:
+        plan_state.initialized = False
+        plan_state.has_executable_plan = False
+        print(f"[PLAN-STATE] Step={current_step} Plan marked INVALID: 0 executable assignments")
+        return
+
     plan_state.initialized = True
+    plan_state.has_executable_plan = True
     plan_state.last_replan_step = current_step
     plan_state.known_mode = mode
     plan_state.known_sys_cqi = sys_cqi

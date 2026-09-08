@@ -251,6 +251,36 @@ class CentralizedHybridCoordinator:
         # New plan always requires dispatch
         self._dispatch_domains(coalitions, assignments_map)
         self._last_dispatched_assignments = dict(assignments_map)
+
+        # === B1 CENTRALIZED DEBUG & VALIDATION ===
+        decomp_raw = getattr(self.cloud_llm, "last_decompose_raw", "N/A")
+        decomp_parsed = getattr(self.cloud_llm, "last_decompose_parsed", assignments_map)
+        coal_raw = getattr(self.cloud_llm, "last_coalitions_raw", "N/A")
+        coal_parsed = getattr(self.cloud_llm, "last_coalitions_parsed", coalitions)
+        device_raw = {
+            dom: d.dispatch_result for dom, d in self._last_dispatch_directives.items()
+        }
+        executable_assignments = self.extract_executable_assignments(assignments_map)
+
+        print("\n=== B1 CENTRALIZED DEBUG ===")
+        print(f"DECOMPOSE_RAW = {decomp_raw}")
+        print(f"DECOMPOSE_PARSED = {decomp_parsed}")
+        print(f"COALITIONS_RAW = {coal_raw}")
+        print(f"COALITIONS_PARSED = {coal_parsed}")
+        print(f"DEVICE_RAW = {device_raw}")
+        print(f"FINAL_PLAN = {assignments_map}")
+        print(f"ASSIGNMENTS = {assignments_map}")
+        print(f"EXECUTABLE_ASSIGNMENTS = {executable_assignments}")
+        print("============================\n")
+
+        planned_tasks = len([s for s in subtasks if not s.completed])
+        assigned_tasks = len([sid for sid, aids in assignments_map.items() if aids])
+        executable_count = len(executable_assignments)
+
+        print(f"planned tasks = {planned_tasks}")
+        print(f"assigned tasks = {assigned_tasks}")
+        print(f"executable assignments = {executable_count}")
+
         return assignments_map, coalitions, cloud_reasoned, True
 
     def extract_executable_assignments(
@@ -263,10 +293,21 @@ class CentralizedHybridCoordinator:
         Cloud Plan -> Device LLM Dispatch -> ExecutionDirective -> Agent Execution Path.
         """
         agent_assignments: dict[str, str] = {}
+        assigned_agents: set[str] = set()
+
         # 1. Base active subtasks from global assignments
         for sid, agents in fallback_assignments.items():
-            if agents:
-                agent_assignments[agents[0]] = sid
+            if not agents:
+                continue
+            chosen = None
+            for a in agents:
+                if a not in assigned_agents:
+                    chosen = a
+                    break
+            if chosen is None:
+                chosen = agents[0]
+            agent_assignments[chosen] = sid
+            assigned_agents.add(chosen)
 
         # 2. Consume and apply Device LLM ExecutionDirectives
         for directive in self._last_dispatch_directives.values():

@@ -9,6 +9,7 @@ continuing under a different (unlabeled) planning algorithm.
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -64,7 +65,8 @@ class FailureReport:
             f"_seed{self.seed}_step{self.simulation_step}_{int(time.time())}.json"
         )
         path = out_dir / fname
-        with open(path, "w", encoding="utf-8") as f:
+        target_path = Path(r"\\?\\" + str(path.resolve())) if os.name == "nt" else path
+        with open(target_path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2)
         return path
 
