@@ -136,10 +136,12 @@ class AssignmentValidator:
                     missing = sorted(list(required - coalition_skills))
                     return False, f"missing_required_skill:{missing}"
             else:
-                # Semantic impossibility: agent/coalition has zero matching skills
-                if not (required & coalition_skills):
-                    missing = sorted(list(required))
-                    return False, f"no_matching_skills:required={missing},available={sorted(list(coalition_skills))}"
+                # Issue 1 fix: required skills are a hard constraint —
+                # the assigned agent/coalition must cover ALL required skills,
+                # not just overlap with at least one.
+                if not required.issubset(coalition_skills):
+                    missing = sorted(list(required - coalition_skills))
+                    return False, f"missing_required_skill:{missing}"
 
         return True, ""
 
@@ -399,9 +401,10 @@ def validate_global_assignment_state(
                         print(msg)
                         violations.append(msg)
                 else:
-                    if not (req & coalition_skills):
+                    # Issue 1 fix: require full skill coverage even in non-strict mode
+                    if not req.issubset(coalition_skills):
                         msg = (
-                            f"[STATE-INVARIANT-VIOLATION] invariant=INVARIANT_6_NO_MATCHING_SKILLS "
+                            f"[STATE-INVARIANT-VIOLATION] invariant=INVARIANT_6_MISSING_REQUIRED_SKILLS "
                             f"task={sid} agent={aid} required={sorted(list(req))} available={sorted(list(coalition_skills))} "
                             f"source={source} mode={mode} step={step}"
                         )

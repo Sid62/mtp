@@ -66,7 +66,8 @@ def test_completed_task_does_not_trigger_repeated_replans():
     subtasks = env.subtask_list
     fleet = env.fleet
 
-    # Initialize plan
+    # Initialize plan with skilled agent for valid baseline plan state
+    fleet.agents[0].skills = ["transport", "navigate", "lift", "sense", "inspect", "rescue"]
     assignments = {s.subtask_id: [fleet.agents[0].agent_id] for s in subtasks}
     update_plan_state(plan_state, subtasks, fleet, [], assignments, mode=0, current_step=0)
     assert plan_state.known_completed_ids == set()

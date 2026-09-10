@@ -339,15 +339,18 @@ class CentralizedHybridCoordinator:
             dom: d.dispatch_result for dom, d in self._last_dispatch_directives.items()
         }
 
+        def _safe_str(val: Any) -> str:
+            return str(val).encode("ascii", "backslashreplace").decode("ascii")
+
         print("\n=== B1 CENTRALIZED DEBUG ===")
-        print(f"DECOMPOSE_RAW = {decomp_raw}")
-        print(f"DECOMPOSE_PARSED = {decomp_parsed}")
-        print(f"COALITIONS_RAW = {coal_raw}")
-        print(f"COALITIONS_PARSED = {coal_parsed}")
-        print(f"DEVICE_RAW = {device_raw}")
-        print(f"FINAL_PLAN = {assignments_map}")
-        print(f"ASSIGNMENTS = {assignments_map}")
-        print(f"EXECUTABLE_ASSIGNMENTS = {executable_assignments}")
+        print(f"DECOMPOSE_RAW = {_safe_str(decomp_raw)}")
+        print(f"DECOMPOSE_PARSED = {_safe_str(decomp_parsed)}")
+        print(f"COALITIONS_RAW = {_safe_str(coal_raw)}")
+        print(f"COALITIONS_PARSED = {_safe_str(coal_parsed)}")
+        print(f"DEVICE_RAW = {_safe_str(device_raw)}")
+        print(f"FINAL_PLAN = {_safe_str(assignments_map)}")
+        print(f"ASSIGNMENTS = {_safe_str(assignments_map)}")
+        print(f"EXECUTABLE_ASSIGNMENTS = {_safe_str(executable_assignments)}")
         print("============================\n")
 
         total_tasks = len(subtasks)

@@ -268,7 +268,7 @@ class PlanContinuityEngine:
                     agent = agent_map[aid]
                     has_skills = (
                         not st.required_skills
-                        or bool(set(st.required_skills) & set(agent.skills))
+                        or set(st.required_skills).issubset(set(agent.skills))
                     )
                     if has_skills and dist(agent.position, st.target) < lock_threshold:
                         # Lock agent to this subtask
@@ -317,7 +317,7 @@ class PlanContinuityEngine:
                     and aid not in assigned_agents
                     and (sid, aid) not in ctx.rejected_mappings
                 ):
-                    if not s.required_skills or (set(s.required_skills) & set(agent_map[aid].skills)):
+                    if not s.required_skills or (set(s.required_skills).issubset(set(agent_map[aid].skills))):
                         curr_agents.append(aid)
                         assigned_agents.add(aid)
                         break  # Strict 1-to-1 matching: 1 agent per task
@@ -344,7 +344,7 @@ class PlanContinuityEngine:
                             eligible = [
                                 aid for aid in freed_agents
                                 if (sid, aid) not in ctx.rejected_mappings
-                                and bool(set(st.required_skills) & set(agent_map[aid].skills))
+                                and set(st.required_skills).issubset(set(agent_map[aid].skills))
                             ]
                         if eligible:
                             best_agent = min(

@@ -688,24 +688,9 @@ class DACAOrchestrator:
                                 self.fallback_count += 1
                                 print(f"[FALLBACK] Reallocation Pass 2: assigning agent {best_aid} beyond R_reach for subtask {st.subtask_id}")
 
-                        # Pass 2b: partial skill-matching agents (at least one matching skill)
-                        if best_aid is None and required:
-                            for aid in all_coalition_agents:
-                                if aid in assigned_agents or (st.subtask_id, aid) in rejected_mappings:
-                                    continue
-                                if not fleet.has_agent(aid):
-                                    continue
-                                skills = agent_skills.get(aid, set())
-                                if not (required & skills):
-                                    continue
-                                agent = fleet.get_agent(aid)
-                                d = dist(agent.position, st.target)
-                                if d < best_d:
-                                    best_d = d
-                                    best_aid = aid
-                            if best_aid is not None:
-                                self.fallback_count += 1
-                                print(f"[FALLBACK] Reallocation Pass 2b: assigning agent {best_aid} with partial skills for subtask {st.subtask_id}")
+                        # Issue 1 fix: Pass 2b (partial-skill) removed.
+                        # Required skills are a hard constraint — only agents
+                        # whose skills fully cover the task requirements are valid.
 
                         # INVARIANT 7 & 8: No nearest-agent fallback without skill match.
                         # If no valid agent exists, task remains explicitly UNRESOLVED.
@@ -726,7 +711,7 @@ class DACAOrchestrator:
                             prior_aids = [
                                 a for a in assignments[st.subtask_id]
                                 if fleet.has_agent(a)
-                                and (not required or bool(required & agent_skills.get(a, set())))
+                                and (not required or required.issubset(agent_skills.get(a, set())))
                                 and a not in assigned_agents
                                 and (st.subtask_id, a) not in rejected_mappings
                             ]
@@ -1132,6 +1117,21 @@ class DACAOrchestrator:
                        )
                     from src.coordination.constants import COMPLETION_RADIUS_M
                     if not subtask.completed and dist(agent.position, subtask.target) < COMPLETION_RADIUS_M:
+                        # Issue 1 fix: verify skill coverage before completion.
+                        # Collect skills from ALL assigned agents for this task.
+                        team_skills: set[str] = set()
+                        for assigned_aid in agent_list:
+                            if fleet.has_agent(assigned_aid):
+                                team_skills.update(fleet.get_agent(assigned_aid).skills)
+                        required_skills = set(subtask.required_skills)
+                        if required_skills and not required_skills.issubset(team_skills):
+                            missing = sorted(list(required_skills - team_skills))
+                            if step % 50 == 0:
+                                print(
+                                    f"[COMPLETION-BLOCKED] Step={step} Task={sid} "
+                                    f"Agent={agent.agent_id} missing_skills={missing}"
+                                )
+                            continue
                         transitioned = self.env.mark_subtask_complete(sid)
                         if transitioned:
                             # Invariants 3, 9, 11: Atomically purge completed task from all active structures

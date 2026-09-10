@@ -11,6 +11,7 @@ def test_static_baseline_ignores_cqi_drift():
     subtasks = env.subtask_list
     fleet = env.fleet
 
+    fleet.agents[0].skills = ["transport", "navigate", "lift", "sense", "inspect", "rescue"]
     assignments = {s.subtask_id: [fleet.agents[0].agent_id] for s in subtasks}
     update_plan_state(plan_state, subtasks, fleet, [], assignments, mode=0, sys_cqi=1.0, current_step=0)
 
@@ -33,6 +34,7 @@ def test_static_baseline_ignores_packet_loss_threshold():
     subtasks = env.subtask_list
     fleet = env.fleet
 
+    fleet.agents[0].skills = ["transport", "navigate", "lift", "sense", "inspect", "rescue"]
     assignments = {s.subtask_id: [fleet.agents[0].agent_id] for s in subtasks}
     update_plan_state(plan_state, subtasks, fleet, [], assignments, mode=0, packet_loss=0.0, current_step=0)
 

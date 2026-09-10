@@ -525,7 +525,7 @@ class CloudLLMClient:
         assigned_agents: set[str] = set()
         for i, st in enumerate(subtasks):
             st_id = str(st.get("id", st.get("subtask_id", f"T_{i}")))
-            req_skills = set(st.get("required_skills", []))
+            req_skills = set(st.get("required_skills", st.get("skills", [])))
             best_agent = None
             best_overlap = -1
             for a in agents:

@@ -195,7 +195,17 @@ def create_fleet_from_scenario(
     """Instantiate heterogeneous fleet for a scenario."""
     rng = np.random.default_rng(seed)
     agents: list[AgentState] = []
-    skill_pool = ["transport", "inspect", "lift", "navigate", "sense", "rescue"]
+    # Issue 1 fix: role-based deterministic skills per agent type.
+    # Matches AutoHMA-LLM Section V-A role descriptions:
+    # - UAVs: aerial delivery/transport + navigation + surveillance
+    # - Vehicles: ground transport + navigation + equipment inspection
+    # - Robots: heavy lift + transport + rescue extraction + sensing
+    # Guarantees every scenario-required skill pair is coverable.
+    type_skills = {
+        AgentType.UAV: ["transport", "navigate", "sense", "inspect"],
+        AgentType.VEHICLE: ["transport", "navigate", "inspect"],
+        AgentType.ROBOT: ["lift", "transport", "rescue", "sense", "inspect"],
+    }
     idx = 0
     for agent_type, count_key in [
         (AgentType.UAV, "num_uav"),
@@ -214,7 +224,7 @@ def create_fleet_from_scenario(
                         y=float(rng.uniform(0, 200)),
                     ),
                     heading=float(rng.uniform(0, 2 * math.pi)),
-                    skills=list(rng.choice(skill_pool, size=2, replace=False)),
+                    skills=list(type_skills[agent_type]),
                 )
             )
             idx += 1

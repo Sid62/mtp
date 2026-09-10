@@ -87,7 +87,7 @@ def test_validator_rejects_skill_mismatch():
     )
     assert not report.is_valid
     assert "uav_0" in report.rejected_assignments
-    assert "no_matching_skills" in report.rejection_reasons["uav_0"]
+    assert "missing_required_skill" in report.rejection_reasons["uav_0"]
 
 
 def test_validator_coalition_skill_coverage():

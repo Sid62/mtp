@@ -64,10 +64,12 @@ def test_property_1_and_4_incompatible_skills_rejected(base_scenario_cfg, base_k
         Subtask(subtask_id="T_1", description="nav task", target=Position(20, 20), required_skills=["sense", "navigate"]),
     ]
 
-    # Find an agent that has neither lift nor rescue
+    # With role-based skills, UAVs have [transport,navigate,sense] and Vehicles
+    # have [transport,navigate,inspect]; neither has 'lift' or 'rescue'.
     incompatible_agent = None
     for a in fleet.agents:
-        if not ({"lift", "rescue"} & set(a.skills)):
+        if not ({"lift", "rescue"}.issubset(set(a.skills))):
+            # Agent does NOT have BOTH lift AND rescue → incompatible with T_0
             incompatible_agent = a.agent_id
             break
 
@@ -78,7 +80,7 @@ def test_property_1_and_4_incompatible_skills_rejected(base_scenario_cfg, base_k
         )
         assert incompatible_agent not in report.valid_assignments
         assert incompatible_agent in report.rejected_assignments
-        assert "no_matching_skills" in report.rejection_reasons[incompatible_agent]
+        assert "missing_required_skill" in report.rejection_reasons[incompatible_agent]
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
@@ -221,6 +223,6 @@ def test_property_11_global_state_validator_catches_all_violations(base_scenario
     assert "INVARIANT_1_NONEXISTENT_AGENT" in violation_text
     assert "INVARIANT_2_NONEXISTENT_TASK" in violation_text
     assert "INVARIANT_3_COMPLETED_TASK_ACTIVE" in violation_text
-    assert "INVARIANT_6_NO_MATCHING_SKILLS" in violation_text
+    assert "INVARIANT_6_MISSING_REQUIRED_SKILLS" in violation_text
     assert "INVARIANT_12_AGENT_MULTIPLY_ASSIGNED" in violation_text
 
